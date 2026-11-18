@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IT Administration</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="app/app.css">
+  <script>try { var t = JSON.parse(localStorage.getItem('itadm.theme') || '"system"'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}</script>
+</head>
+<body class="app-it">
+  <a class="skip" href="#main">تخطي إلى المحتوى</a>
+  <header class="topbar">
+    <button class="icon-btn menu" id="menuBtn" aria-label="القائمة">☰</button>
+    <div class="brand"><b class="logo-dot" aria-hidden="true">IT</b> <span class="tb-name">IT Administration</span></div>
+    <span class="spacer"></span>
+    <select id="companyFilter" class="company-filter" aria-label="فلتر الشركة" hidden></select>
+    <button class="icon-btn" id="bellBtn" aria-label="الإشعارات" title="الإشعارات">🔔<span id="bellCount" class="bell-count" hidden></span></button>
+    <button class="icon-btn" id="themeBtn" aria-label="المظهر">◐</button>
+    <div class="user-box"><span id="userName"></span><button class="btn ghost sm" id="logoutBtn">خروج</button></div>
+  </header>
+  <aside class="sidebar"><nav class="nav" id="nav" aria-label="القائمة الرئيسية"></nav></aside>
+  <main id="main" tabindex="-1"></main>
+  <div id="toasts" aria-live="polite"></div>
+
+  <script src="app/core.js"></script>
+  <script src="app/pages-dashboard.js"></script>
+  <script src="app/pages-assets.js"></script>
+  <script src="app/pages-journey.js"></script>
+  <script src="app/pages-technical.js"></script>
+  <script src="app/pages-finance.js"></script>
+  <script src="app/pages-system.js"></script>
+</body>
+</html>

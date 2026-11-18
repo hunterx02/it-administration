@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>Shell preview (local demo only)</title></head>
+<body>
+<script>
+  // أداة اختبار محلية فقط: تفتح it.html بحساب الديمو المحلي (u_admin) بدون شاشة الدخول، لالتقاط صور الواجهة.
+  // لا تعمل مع حسابات الـ Backend الحقيقية ولا تتجاوز أي حماية على السيرفر.
+  const q = new URLSearchParams(location.search);
+  sessionStorage.setItem('crm_finance_session', JSON.stringify({ userId: q.get('user') || 'u_admin', at: new Date().toISOString() }));
+  if (q.get('theme')) localStorage.setItem('it_assets_theme', q.get('theme'));
+  location.replace('../it.html#/' + (q.get('page') || 'itdash'));
+</script>
+</body></html>

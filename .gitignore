@@ -1,0 +1,11 @@
+# never commit data, secrets or environments
+backend/.venv/
+backend/data/
+backend/.env
+**/secrets/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+.pytest_cache/
+frontend/scripts/we-usage/config.json

@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+sqlalchemy==2.0.36
+python-multipart==0.0.20
+openpyxl==3.1.5
+# tests
+pytest==8.3.4
+httpx==0.28.1
+# Live Google connectors (install when the company provides a service account):
+#   pip install google-api-python-client==2.151.0 google-auth==2.36.0
+# PostgreSQL on VPS:
+#   pip install "psycopg[binary]==3.2.3"   and set ITADM_DATABASE_URL=postgresql+psycopg://user:pass@host/db
