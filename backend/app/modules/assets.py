@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -154,7 +154,7 @@ ASSET_FIELDS = ["id", "code", "company_id", "category_code", "seq", "hostname", 
                 "source", "version", "updated_at"]
 EDITABLE = {"hostname", "brand", "model", "serial", "cpu", "ram_gb", "storage", "gpu", "os", "screen_info",
             "branch_id", "department_id", "location", "tech_condition", "accessories", "purchase_date",
-            "warranty_end", "supplier_id", "vault_ref", "notes"}
+            "warranty_end", "supplier_id", "notes"}  # vault_ref only via the password endpoints
 
 
 def seed_categories(db: Session) -> None:
@@ -166,6 +166,8 @@ def seed_categories(db: Session) -> None:
 def asset_out(a: Asset, db: Session | None = None) -> dict:
     d = row(a, ASSET_FIELDS)
     d["allocation_ar"], d["condition_ar"] = ALLOCATION.get(a.allocation_status, ""), CONDITION.get(a.tech_condition, "")
+    d["has_password"] = (a.vault_ref or "").startswith("vault:")
+    d["vault_ref"] = "🔒" if d["has_password"] else (a.vault_ref and "مرجع خارجي")  # never expose the store key
     if db is not None:
         for key, eid in (("holder_name", a.holder_employee_id), ("reserved_for_name", a.reserved_for_employee_id)):
             e = db.get(Employee, eid) if eid else None
@@ -179,9 +181,23 @@ def record_event(db: Session, a: Asset, kind: str, actor_id: str | None, **kw) -
     return ev
 
 
+def assert_serial_unique(db: Session, serial: str | None, exclude_id: str | None = None) -> None:
+    """A serial / IMEI belongs to one physical device only (case/space-insensitive)."""
+    s = (serial or "").strip()
+    if not s:
+        return
+    q = select(Asset).where(func.lower(func.trim(Asset.serial)) == s.lower())
+    if exclude_id:
+        q = q.where(Asset.id != exclude_id)
+    other = db.scalar(q.limit(1))
+    if other is not None:
+        raise conflict(f"السيريال «{s}» متسجل بالفعل على الأصل {other.code}")
+
+
 def create_asset(db: Session, *, company_id: str, category_code: str, actor_id: str | None, source: str = "ui",
                  **fields) -> Asset:
     company = get_company(db, company_id)
+    assert_serial_unique(db, fields.get("serial"))
     cat = db.get(AssetCategory, category_code)
     if cat is None:
         raise bad(f"فئة غير معروفة: {category_code}")
@@ -338,6 +354,28 @@ def add_category(body: CategoryIn, request: Request, p: Principal = Depends(requ
     return body.model_dump()
 
 
+class CategoryPatch(BaseModel):
+    name_ar: str | None = Field(default=None, min_length=1, max_length=100)
+    name_en: str | None = None
+    seq_width: int | None = Field(default=None, ge=1, le=6)
+
+
+@router.patch("/categories/{code}")
+def edit_category(code: str, body: CategoryPatch, request: Request, p: Principal = Depends(require("system:edit")),
+                  db: Session = Depends(get_db)) -> dict:
+    """Rename a category. The code itself never changes (existing asset codes depend on it)."""
+    cat = db.get(AssetCategory, code)
+    if cat is None:
+        raise not_found("الفئة غير موجودة")
+    changes = body.model_dump(exclude_none=True)
+    for k, v in changes.items():
+        setattr(cat, k, v)
+    audit.record(db, "asset_category.updated", actor_id=p.user.id, entity="asset_category", entity_id=code,
+                 details=changes, ip=client_ip(request))
+    db.commit()
+    return {"code": cat.code, "name_ar": cat.name_ar, "name_en": cat.name_en, "seq_width": cat.seq_width}
+
+
 @router.get("")
 def list_assets(company_id: str | None = None, category: str | None = None, allocation: str | None = None,
                 condition: str | None = None, department_id: str | None = None, holder: str | None = None,
@@ -401,6 +439,8 @@ def update(asset_id: str, body: AssetPatch, request: Request, p: Principal = Dep
     changes = body.model_dump(exclude_unset=True, exclude={"version"})
     if "tech_condition" in changes and changes["tech_condition"] not in CONDITION:
         raise bad("حالة فنية غير صحيحة")
+    if "serial" in changes:
+        assert_serial_unique(db, changes["serial"], exclude_id=a.id)
     applied = apply_changes(a, changes, EDITABLE)
     if applied:
         a.source = "ui"
@@ -602,6 +642,141 @@ def close_maintenance(maint_id: str, body: MaintClose, request: Request,
                  ip=client_ip(request))
     db.commit()
     return row(m, ["id", "asset_id", "issue", "vendor", "opened_at", "closed_at", "result", "status"])
+
+
+# ---------------------------------------------------------------- device passwords (encrypted store)
+PW_PREFIX = "asset-pw-"
+
+
+def _store(request: Request):  # noqa: ANN202
+    from ..secrets_store import SecretStoreError, store_for
+    try:
+        return store_for(request.app.state.settings)
+    except SecretStoreError as e:
+        raise bad(str(e)) from None
+
+
+def save_device_password(store, a: Asset, password: str) -> None:  # noqa: ANN001
+    """Encrypt and keep the device password outside the DB; the asset only keeps an opaque vault reference."""
+    store.set(PW_PREFIX + a.id, password)
+    a.vault_ref = "vault:" + PW_PREFIX + a.id
+
+
+class PasswordIn(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
+
+
+@router.put("/{asset_id}/password")
+def set_device_password(asset_id: str, body: PasswordIn, request: Request,
+                        p: Principal = Depends(require("assets:edit", "assets:view_secrets")),
+                        db: Session = Depends(get_db)) -> dict:
+    a = load_asset(db, p, asset_id)
+    save_device_password(_store(request), a, body.password)
+    a.version += 1
+    audit.record(db, "asset.password_set", actor_id=p.user.id, entity="asset", entity_id=a.id, company_id=a.company_id,
+                 ip=client_ip(request))
+    db.commit()
+    return {"has_password": True}
+
+
+@router.post("/{asset_id}/password/reveal")
+def reveal_device_password(asset_id: str, request: Request, p: Principal = Depends(require("assets:view_secrets")),
+                           db: Session = Depends(get_db)) -> dict:
+    """Returns the password to an authorised user — and leaves an audit trail every single time."""
+    a = load_asset(db, p, asset_id)
+    if not (a.vault_ref or "").startswith("vault:"):
+        raise not_found("مفيش كلمة مرور محفوظة للجهاز ده")
+    value = _store(request).get(a.vault_ref[6:])
+    if value is None:
+        raise not_found("كلمة المرور مش موجودة في المخزن")
+    audit.record(db, "asset.password_revealed", actor_id=p.user.id, entity="asset", entity_id=a.id,
+                 company_id=a.company_id, details={"code": a.code}, ip=client_ip(request))
+    db.commit()
+    return {"password": value}
+
+
+@router.delete("/{asset_id}/password")
+def delete_device_password(asset_id: str, request: Request,
+                           p: Principal = Depends(require("assets:edit", "assets:view_secrets")),
+                           db: Session = Depends(get_db)) -> dict:
+    a = load_asset(db, p, asset_id)
+    if (a.vault_ref or "").startswith("vault:"):
+        _store(request).delete(a.vault_ref[6:])
+    a.vault_ref = ""
+    a.version += 1
+    audit.record(db, "asset.password_deleted", actor_id=p.user.id, entity="asset", entity_id=a.id,
+                 company_id=a.company_id, ip=client_ip(request))
+    db.commit()
+    return {"has_password": False}
+
+
+# ---------------------------------------------------------------- swap: employee changes device
+class SwapIn(BaseModel):
+    new_asset_id: str
+    old_result: str = Field(default="returned", pattern="^(returned|damaged|missing)$")
+    notes: str = ""
+
+
+@router.post("/{asset_id}/swap")
+def swap_device(asset_id: str, body: SwapIn, request: Request, p: Principal = Depends(require("assets:edit")),
+                db: Session = Depends(get_db)) -> dict:
+    """Atomic: return the employee's current device (with its condition) and hand over the replacement.
+    Both custody events are recorded; if the handover is not allowed (e.g. offboarding freeze) nothing changes."""
+    old = load_asset(db, p, asset_id)
+    new = load_asset(db, p, body.new_asset_id)
+    if old.id == new.id:
+        raise bad("اختار جهاز تاني")
+    if old.allocation_status != "assigned" or not old.holder_employee_id:
+        raise conflict("الجهاز الحالي مش مسلّم لموظف")
+    emp_id = old.holder_employee_id
+    note = (f"استبدال: {old.code} → {new.code}. " + body.notes).strip()
+    try:
+        with db.begin_nested():
+            do_return(db, old, body.old_result, p.user.id, note)
+            do_handover(db, new, emp_id, p.user.id, note)
+    except HTTPException:
+        db.rollback()
+        raise
+    audit.record(db, "asset.swapped", actor_id=p.user.id, entity="asset", entity_id=new.id, company_id=new.company_id,
+                 details={"employee_id": emp_id, "old": old.code, "new": new.code, "old_result": body.old_result},
+                 ip=client_ip(request))
+    db.commit()
+    return {"old": asset_out(old, db), "new": asset_out(new, db)}
+
+
+# ---------------------------------------------------------------- category change
+class RecategorizeIn(BaseModel):
+    category_code: str
+    reason: str = Field(min_length=3)
+
+
+@router.post("/{asset_id}/category")
+def change_category(asset_id: str, body: RecategorizeIn, request: Request,
+                    p: Principal = Depends(require("assets:edit")), db: Session = Depends(get_db)) -> dict:
+    """Move a device to another category (e.g. CMP -> CMPM). It gets the next code in the new category; the old
+    code is kept in the custody history so labels/paperwork can be traced. Reprint the asset label afterwards."""
+    a = load_asset(db, p, asset_id)
+    cat = db.get(AssetCategory, body.category_code)
+    if cat is None:
+        raise bad("فئة غير معروفة")
+    if cat.code == a.category_code:
+        raise bad("الجهاز في الفئة دي بالفعل")
+    company = get_company(db, a.company_id)
+    old_code = a.code
+    seq = (db.scalar(select(func.max(Asset.seq)).where(Asset.company_id == a.company_id,
+                                                       Asset.category_code == cat.code)) or 0) + 1
+    a.category_code, a.seq, a.code = cat.code, seq, f"{company.asset_prefix}-{cat.code}-{seq:0{cat.seq_width}d}"
+    a.version += 1
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise conflict("تعارض في توليد الكود، حاول مرة تانية") from None
+    record_event(db, a, "recategorized", p.user.id, notes=f"{old_code} → {a.code}. السبب: {body.reason}")
+    audit.record(db, "asset.recategorized", actor_id=p.user.id, entity="asset", entity_id=a.id, company_id=a.company_id,
+                 details={"old_code": old_code, "new_code": a.code, "reason": body.reason}, ip=client_ip(request))
+    db.commit()
+    return asset_out(a, db)
 
 
 def employee_assets(db: Session, employee_id: str) -> list[Asset]:

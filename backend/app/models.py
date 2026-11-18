@@ -35,6 +35,9 @@ class Company(Base):
     name: Mapped[str] = mapped_column(String(200), unique=True)
     asset_prefix: Mapped[str] = mapped_column(String(20), default="")  # e.g. user-defined; never invented
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Letterhead (company-owned images uploaded by the user; nothing taken from reference forms)
+    letterhead_header_file_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    letterhead_footer_file_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     branches: Mapped[list[Branch]] = relationship(back_populates="company", cascade="all, delete-orphan")
     departments: Mapped[list[Department]] = relationship(back_populates="company", cascade="all, delete-orphan")
@@ -89,6 +92,10 @@ class User(Base):
     all_companies: Mapped[bool] = mapped_column(Boolean, default=False)  # scope: every company
     theme: Mapped[str] = mapped_column(String(10), default="system")  # light | dark | system
     failed_logins: Mapped[int] = mapped_column(Integer, default=0)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mfa_secret_enc: Mapped[str] = mapped_column(String(400), default="")   # AES-GCM encrypted TOTP secret
+    mfa_pending_enc: Mapped[str] = mapped_column(String(400), default="")  # during setup, before confirmation
+    mfa_last_counter: Mapped[int] = mapped_column(Integer, default=0)      # replay protection
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -140,6 +147,9 @@ class AuditEvent(Base):
     company_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     details: Mapped[dict] = mapped_column(JSON, default=dict)  # never contains secrets
     ip: Mapped[str] = mapped_column(String(64), default="")
+    seq: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)  # chain order
+    prev_hash: Mapped[str] = mapped_column(String(64), default="")
+    hash: Mapped[str] = mapped_column(String(64), default="")  # sha256(prev_hash + canonical event) — tamper evident
 
 
 class IntegrationConfig(Base):
@@ -158,6 +168,7 @@ class IntegrationConfig(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     credential_ref: Mapped[str] = mapped_column(String(200), default="")
     source_ref: Mapped[str] = mapped_column(String(300), default="")  # spreadsheet/folder/form id
+    link_url: Mapped[str] = mapped_column(String(500), default="")    # human link: "افتح الشيت" buttons
     status: Mapped[str] = mapped_column(String(40), default="not_configured")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="")

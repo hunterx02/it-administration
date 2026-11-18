@@ -493,11 +493,8 @@ def print_pr(pr_id: str, request: Request, p: Principal = Depends(require("finan
     audit.record(db, "purchase_request.printed", actor_id=p.user.id, entity="purchase_request", entity_id=pr.id,
                  company_id=pr.company_id, ip=client_ip(request))
     db.commit()
-    page = f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>{pr.code}</title>
-<style>@page{{size:A4;margin:18mm}}body{{font-family:Cairo,Tahoma,sans-serif;color:#000}}h1{{font-size:20px;text-align:center}}
-table{{width:100%;border-collapse:collapse}}td,th{{border:1px solid #555;padding:7px;font-size:13px}}.m td{{border:0}}
-.sig td{{height:60px}}@media print{{button{{display:none}}}}</style></head><body><button onclick="print()">طباعة</button>
-<h1>طلب شراء — قسم تقنية المعلومات</h1>
+    from .printing import doc_page
+    body = f"""<h1>طلب شراء — قسم تقنية المعلومات</h1>
 <table class="m"><tr><td>رقم الطلب: <b>{pr.code}</b></td><td>التاريخ: {pr.request_date}</td></tr>
 <tr><td>الشركة: {h.escape(c.name)}</td><td>الفرع: {h.escape(br.name if br else '—')}</td></tr>
 <tr><td>الأقسام المستفيدة: {h.escape('، '.join(d.name for d in deps if d) or '—')}</td><td>مقدم الطلب: {h.escape(pr.requester)}</td></tr>
@@ -506,8 +503,8 @@ table{{width:100%;border-collapse:collapse}}td,th{{border:1px solid #555;padding
 <tr><td colspan="5"><b>الإجمالي التقديري ({pr.currency})</b></td><td><b>{t['estimated']}</b></td></tr></table><br>
 <table class="sig"><tr><th>اعتماد الرئيس التنفيذي (ورقي)</th><th>الاسم</th><th>التوقيع</th><th>التاريخ</th></tr>
 <tr><td>☐ موافق &nbsp; ☐ مرفوض</td><td></td><td></td><td></td></tr></table>
-<p>ملاحظات: ____________________________________________</p></body></html>"""
-    return HTMLResponse(page)
+<p>ملاحظات: ____________________________________________</p>"""
+    return HTMLResponse(doc_page(db, pr.company_id, pr.code, body))
 
 
 @router.post("/purchase-requests/{pr_id}/approval")

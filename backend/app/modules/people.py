@@ -56,6 +56,15 @@ EMPLOYEE_PUBLIC_FIELDS = ["id", "employee_code", "company_id", "branch_id", "dep
                           "exit_date", "version"]
 
 
+def next_employee_code(db: Session, company_id: str) -> str:
+    """Auto employee code: <CompanyPrefix>-EMP-0001 (or EMP-0001 when the company has no prefix). Unique (highest + 1)."""
+    from ..common import next_code
+    from ..models import Company
+    c = db.get(Company, company_id)
+    prefix = f"{c.asset_prefix}-EMP-" if c and c.asset_prefix else "EMP-"
+    return next_code(db, Employee, Employee.employee_code, prefix, 4)
+
+
 def get_employee(db: Session, employee_id: str | None) -> Employee:
     e = db.get(Employee, employee_id) if employee_id else None
     if e is None:

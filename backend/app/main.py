@@ -15,6 +15,9 @@ UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 CSRF_HEADER = "x-itadm-request"
 # Folders of the copied frontend that must never be served over HTTP.
 BLOCKED_PREFIXES = ("/scripts/",)
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+       "font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self'; "
+       "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -40,13 +43,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "same-origin")
+        # CSP: same-origin only (inline kept for the legacy pages and print buttons); no external scripts/connections
+        response.headers.setdefault("Content-Security-Policy", CSP)
         if path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-store")
+        else:
+            # Frontend files: always revalidate (ETag/Last-Modified -> cheap 304) so updates show without Ctrl+F5
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
-    from .modules import assets, automation, files, finance, journey, migration, ops, technical
+    from .modules import (assets, automation, files, finance, imports, journey, lists, mailboxes, migration, ops,
+                          printing, technical)
     for r in (health.router, auth.router, users.router, org.router, audit_log.router, files.router, assets.router,
-              technical.router, journey.router, finance.router, ops.router, automation.router, migration.router):
+              technical.router, mailboxes.router, journey.router, finance.router, ops.router, automation.router, migration.router,
+              lists.router, printing.router, imports.router):
         app.include_router(r)
 
     if settings.frontend_dir.is_dir():

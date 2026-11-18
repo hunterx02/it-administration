@@ -1,3 +1,3 @@
-"""IT Administration backend (RC1 core)."""
+﻿"""IT Administration backend (RC1 core)."""
 
-__version__ = "0.1.0-core"
+__version__ = "1.2.0"

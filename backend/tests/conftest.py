@@ -22,7 +22,9 @@ ADMIN = ("admin@test.local", "Adm1nPassw0rd")
 def app(tmp_path):
     settings = Settings(env="test", database_url=f"sqlite:///{(tmp_path / 't.db').as_posix()}",
                         frontend_dir=tmp_path / "no-frontend", session_hours=1, cookie_secure=False,
-                        allowed_origins=(), data_dir=tmp_path)
+                        allowed_origins=(), data_dir=tmp_path,
+                        secret_key="MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+                        secrets_path=tmp_path / "outside-project" / "secrets.enc.json")
     app = create_app(settings)
     with app.state.db.SessionLocal() as s:
         role = s.scalar(select(Role).where(Role.key == "super_admin"))

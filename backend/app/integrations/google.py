@@ -64,22 +64,101 @@ class MemorySheetsTransport:
         self.books[spreadsheet_id][tab].extend([list(r) for r in rows])
 
 
+class LocalXlsxTransport:
+    """A local Excel workbook as the data source, edited IN PLACE with openpyxl: formatting, data validation,
+    conditional formatting and formula cells are preserved (formula cells are never overwritten and are read as
+    empty, since they are computed). A one-time .bak copy is taken before the first write of each sync."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        if not self.path.is_file():
+            raise PendingCredentials("ملف Excel المحلي مش موجود — ارفعه من إعداد الموصل")
+        self._backed_up = False
+
+    @staticmethod
+    def _is_formula(v: Any) -> bool:
+        return isinstance(v, str) and v.startswith("=")
+
+    def _load(self):  # noqa: ANN202
+        from openpyxl import load_workbook
+        return load_workbook(self.path)
+
+    def _sheet(self, wb, tab: str):  # noqa: ANN001, ANN202
+        if tab not in wb.sheetnames:
+            raise FileNotFoundError(f"الورقة «{tab}» مش موجودة في الملف")
+        return wb[tab]
+
+    def read(self, spreadsheet_id: str, tab: str) -> list[list[str]]:
+        ws = self._sheet(self._load(), tab)
+        out = []
+        for r in ws.iter_rows(values_only=True):
+            row = []
+            for v in r:
+                if v is None or self._is_formula(v):
+                    row.append("")
+                elif isinstance(v, (datetime, date)):
+                    row.append(v.date().isoformat() if isinstance(v, datetime) else v.isoformat())
+                elif isinstance(v, float) and v.is_integer():
+                    row.append(str(int(v)))
+                else:
+                    row.append(str(v))
+            out.append(row)
+        while out and not any(out[-1]):
+            out.pop()
+        return out
+
+    def _save(self, wb) -> None:  # noqa: ANN001
+        import os
+        import shutil
+        if not self._backed_up:
+            shutil.copy2(self.path, self.path.with_name(self.path.stem + ".bak.xlsx"))
+            self._backed_up = True
+        tmp = self.path.with_name(self.path.stem + ".tmp.xlsx")
+        wb.save(tmp)
+        os.replace(tmp, self.path)
+
+    def write_cells(self, spreadsheet_id: str, tab: str, updates: list[tuple[int, int, Any]]) -> None:
+        wb = self._load()
+        ws = self._sheet(wb, tab)
+        for r, c, v in updates:
+            cell = ws.cell(row=r + 1, column=c + 1)
+            if self._is_formula(cell.value):
+                continue  # never overwrite a formula
+            cell.value = v
+        self._save(wb)
+
+    def append(self, spreadsheet_id: str, tab: str, rows: list[list[Any]]) -> None:
+        wb = self._load()
+        ws = self._sheet(wb, tab)
+        free = [i for i in range(2, ws.max_row + 1)
+                if all(c.value is None or self._is_formula(c.value) for c in ws[i])]  # pre-formatted template rows
+        for line in rows:
+            r = free.pop(0) if free else ws.max_row + 1
+            for c, v in enumerate(line, start=1):
+                cell = ws.cell(row=r, column=c)
+                if not self._is_formula(cell.value):
+                    cell.value = v
+        self._save(wb)
+
+
 class LiveSheetsTransport:
-    """Real Google Sheets API. Requires `google-api-python-client` + `google-auth` and a service-account
-    key file shared on the spreadsheets. Nothing here runs until credentials exist."""
+    """Real Google Sheets API. Requires `google-api-python-client` + `google-auth` and a service-account key —
+    preferably stored in the encrypted secrets store (name = credential_ref); a legacy plain file under
+    data/secrets/<ref>.json is still accepted. Nothing here runs until credentials exist."""
 
     SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    def __init__(self, secrets_dir: Path, credential_ref: str) -> None:
+    def __init__(self, secrets_dir: Path, credential_ref: str, secret_json: str | None = None) -> None:
         key = secrets_dir / f"{credential_ref}.json"
-        if not credential_ref or not key.is_file():
-            raise PendingCredentials(f"ملف الصلاحية «{credential_ref or '—'}» غير موجود في مجلد الأسرار")
+        if not credential_ref or (not secret_json and not key.is_file()):
+            raise PendingCredentials(f"صلاحية Google «{credential_ref or '—'}» مش موجودة في مخزن الأسرار")
         try:
             from google.oauth2 import service_account  # type: ignore
             from googleapiclient.discovery import build  # type: ignore
         except ImportError as e:
             raise PendingCredentials("مكتبات Google غير مثبتة (pip install google-api-python-client google-auth)") from e
-        creds = service_account.Credentials.from_service_account_file(str(key), scopes=self.SCOPES)
+        creds = (service_account.Credentials.from_service_account_info(json.loads(secret_json), scopes=self.SCOPES)
+                 if secret_json else service_account.Credentials.from_service_account_file(str(key), scopes=self.SCOPES))
         self.svc = build("sheets", "v4", credentials=creds, cache_discovery=False).spreadsheets()
 
     @staticmethod
@@ -275,8 +354,62 @@ def sim_sa_mapping() -> EntityMapping:
         ])
 
 
+def sim_eg_mapping() -> EntityMapping:
+    from ..modules.technical import ALLOCATION, NETWORK, Sim
+    return EntityMapping(
+        connector="m04_sims_eg_sheet", tab="شرائح_مصر", key_header="كود الشريحة", model=Sim, key_field="code",
+        columns=[
+            Column("كود الشريحة", "code", "app_only"), Column("الشركة", "company_id", "app_only", to_sheet=_company_name),
+            Column("القسم", "department_id", "app_only", to_sheet=lambda v, o, db: _dept_name(db, o.department_id)),
+            Column("اسم الشريحة", "name"), Column("رقم الهاتف", "number"), Column("السيريال ICCID", "iccid"),
+            Column("المشغل", "operator"),
+            Column("كود المستلم", "holder_employee_id", "app_only", to_sheet=_emp_name("holder_employee_id")),
+            Column("حالة الاستخدام", "allocation_status", "app_only", to_sheet=lambda v, o, db: ALLOCATION.get(v, v)),
+            Column("الحالة الفنية", None, "sheet_ignored"),
+            Column("هل تعمل شبكة؟", "network_status", "app_only", to_sheet=lambda v, o, db: NETWORK.get(v, v)),
+            Column("مكالمات؟", "calls_enabled", "both", to_sheet=lambda v, o, db: bool(v), from_sheet=_bool_in),
+            Column("تاريخ آخر تسليم", "last_handover", "app_only"), Column("مصدر التحديث", "source", "app_only"),
+            Column("ملاحظات", "notes"),
+        ])
+
+
+def lines_mapping() -> EntityMapping:
+    from ..modules.technical import USAGE_AR, Line, due_info, usage_state
+    ui = lambda o: due_info(o.net_last_payment, o.net_period_value, o.net_period_unit, o.net_alert_days)  # noqa: E731
+    ul = lambda o: due_info(o.land_last_payment, o.land_period_value, o.land_period_unit, o.land_alert_days)  # noqa: E731
+    return EntityMapping(
+        connector="m04_services_sheet", tab="الإنترنت_والأرضي", key_header="كود الخط", model=Line, key_field="code",
+        columns=[
+            Column("كود الخط", "code", "app_only"), Column("الشركة", "company_id", "app_only", to_sheet=_company_name),
+            Column("الفرع", None, "sheet_ignored"), Column("رقم الأرضي", "landline_number"), Column("المزود", "provider"),
+            Column("سعة الباقة GB", "quota_gb", "both", from_sheet=_num_in),
+            Column("المستهلك GB", "used_gb", "app_only"), Column("المتبقي GB", "remaining_gb", "app_only"),  # readings only
+            Column("آخر قراءة", "last_reading_at", "app_only", to_sheet=lambda v, o, db: iso(v)[:16] if v else ""),
+            Column("مصدر القراءة", "last_reading_source", "app_only"),
+            Column("آخر دفع إنترنت", "net_last_payment", "app_only"),  # renewal events only
+            Column("مدة إنترنت", "net_period_value", "both", from_sheet=_int_in),
+            Column("وحدة مدة الإنترنت", "net_period_unit", "both", to_sheet=lambda v, o, db: UNIT_OUT.get(v, ""),
+                   from_sheet=lambda v: UNIT_IN.get(str(v).strip(), "")),
+            Column("استحقاق الإنترنت", None, "sheet_ignored", to_sheet=lambda v, o, db: ui(o)["next_due"] or ""),
+            Column("تنبيه الإنترنت (يوم)", "net_alert_days", "both", from_sheet=_int_in),
+            Column("آخر دفع أرضي", "land_last_payment", "app_only"),
+            Column("مدة الأرضي", "land_period_value", "both", from_sheet=_int_in),
+            Column("وحدة مدة الأرضي", "land_period_unit", "both", to_sheet=lambda v, o, db: UNIT_OUT.get(v, ""),
+                   from_sheet=lambda v: UNIT_IN.get(str(v).strip(), "")),
+            Column("استحقاق الأرضي", None, "sheet_ignored", to_sheet=lambda v, o, db: ul(o)["next_due"] or ""),
+            Column("تنبيه الأرضي (يوم)", "land_alert_days", "both", from_sheet=_int_in),
+            Column("ملاحظات", "notes"),
+            Column("عتبة تجهيز الرصيد (GB)", "warn_gb", "both", from_sheet=_num_in),
+            Column("عتبة التجديد العاجل (GB)", "critical_gb", "both", from_sheet=_num_in),
+            Column("حالة الرصيد", None, "sheet_ignored",
+                   to_sheet=lambda v, o, db: USAGE_AR[usage_state(o.remaining_gb, o.warn_gb, o.critical_gb)]),
+        ])
+
+
 MAPPINGS: dict[str, Callable[[], EntityMapping]] = {"m02_assets_sheet": asset_mapping,
-                                                    "m04_sims_sa_sheet": sim_sa_mapping}
+                                                    "m04_sims_sa_sheet": sim_sa_mapping,
+                                                    "m04_sims_eg_sheet": sim_eg_mapping,
+                                                    "m04_services_sheet": lines_mapping}
 
 
 def _get(obj: Any, fieldname: str) -> Any:
@@ -495,14 +628,18 @@ def import_applications(db: Session, transport: SheetsTransport, spreadsheet_id:
     return res
 
 
-def transport_for(cfg: IntegrationConfig, secrets_dir: Path, override: SheetsTransport | None = None) -> SheetsTransport:
+def transport_for(cfg: IntegrationConfig, secrets_dir: Path, override: SheetsTransport | None = None,
+                  secret_lookup: Callable[[str], str | None] | None = None) -> SheetsTransport:
+    if cfg.mode == "local_xlsx":
+        return LocalXlsxTransport(Path(secrets_dir).parent / "workbooks" / cfg.source_ref)
     if override is not None:
         return override
-    return LiveSheetsTransport(secrets_dir, cfg.credential_ref)
+    secret_json = secret_lookup(cfg.credential_ref) if (secret_lookup and cfg.credential_ref) else None
+    return LiveSheetsTransport(secrets_dir, cfg.credential_ref, secret_json)
 
 
 def run_connector(db: Session, cfg: IntegrationConfig, secrets_dir: Path, transport: SheetsTransport | None = None,
-                  actor_id: str | None = None) -> dict:
+                  actor_id: str | None = None, secret_lookup: Callable[[str], str | None] | None = None) -> dict:
     """Run one connector and record an honest status. Never marks healthy without a successful round-trip."""
     if not cfg.enabled:
         return {"status": "disabled"}
@@ -510,7 +647,7 @@ def run_connector(db: Session, cfg: IntegrationConfig, secrets_dir: Path, transp
         cfg.status = "not_configured"
         return {"status": cfg.status}
     try:
-        t = transport_for(cfg, secrets_dir, transport)
+        t = transport_for(cfg, secrets_dir, transport, secret_lookup)
         if cfg.key in MAPPINGS:
             r = sync_entity(db, t, cfg.source_ref, MAPPINGS[cfg.key](), actor_id)
         elif cfg.key in ("m03_application_form", "m03_hr_sheet"):

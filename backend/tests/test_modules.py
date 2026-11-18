@@ -204,9 +204,13 @@ def test_m03_onboarding_docs_versions_acks(app, admin, org):
         assert admin.post(f"/api/employees/{eid}/joining-docs/{d}", json={"file_id": f}, headers=H).status_code == 200
         assert admin.post(f"/api/employees/{eid}/joining-docs/{d}/verify", headers=H).status_code == 200
     ob = admin.get(f"/api/journey/onboarding/{ob['id']}").json()
-    for t in ob["tasks"]:
+    for i, t in enumerate(ob["tasks"]):
         assert admin.post(f"/api/journey/tasks/{t['id']}", json={"status": "verified"}, headers=H).status_code == 409
-        admin.post(f"/api/journey/tasks/{t['id']}", json={"status": "done", "ref": "ref"}, headers=H)
+        if i == 0:  # execute -> evidence -> approve: done without evidence cannot be approved
+            admin.post(f"/api/journey/tasks/{t['id']}", json={"status": "done", "ref": "ref"}, headers=H)
+            assert admin.post(f"/api/journey/tasks/{t['id']}", json={"status": "verified"}, headers=H).status_code == 409
+        ev = upload(admin, "custody_evidence", name="proof.png")
+        admin.post(f"/api/journey/tasks/{t['id']}", json={"status": "done", "ref": "ref", "evidence_file_id": ev}, headers=H)
         assert admin.post(f"/api/journey/tasks/{t['id']}", json={"status": "verified"}, headers=H).status_code == 200
     r = admin.post(f"/api/journey/onboarding/{ob['id']}/complete", headers=H)
     assert r.status_code == 200, r.text

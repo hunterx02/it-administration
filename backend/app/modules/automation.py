@@ -21,7 +21,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -330,9 +330,107 @@ def sync_now(key: str, request: Request, p: Principal = Depends(require("system:
     if cfg is None:
         raise not_found("موصل غير موجود")
     transport = getattr(request.app.state, "sheets_transport", None)  # injected only in tests/demo sandbox
-    res = run_connector(db, cfg, Path(request.app.state.settings.data_dir) / "secrets", transport, p.user.id)
+    res = run_connector(db, cfg, Path(request.app.state.settings.data_dir) / "secrets", transport, p.user.id,
+                        secret_lookup=_secret_lookup(request.app.state.settings))
     db.commit()
     return res
+
+
+def _secret_lookup(settings):  # noqa: ANN001, ANN202
+    from ..secrets_store import SecretStoreError, store_for
+
+    def get(name: str) -> str | None:
+        try:
+            return store_for(settings).get(name)
+        except SecretStoreError:
+            return None
+    return get
+
+
+# --- encrypted secrets (values are write-only: never returned to the browser)
+class SecretIn(BaseModel):
+    value: str = Field(min_length=1, max_length=20000)
+
+
+SECRET_NAME = r"^[A-Za-z0-9_.\-]{1,80}$"
+
+
+@router.get("/secrets")
+def list_secrets(request: Request, _: Principal = Depends(require("system:manage_secrets"))) -> list[dict]:
+    from ..secrets_store import store_for
+    return store_for(request.app.state.settings).names()
+
+
+@router.put("/secrets/{name}")
+def put_secret(name: str, body: SecretIn, request: Request, p: Principal = Depends(require("system:manage_secrets")),
+               db: Session = Depends(get_db)) -> dict:
+    from ..secrets_store import store_for
+    if not re.fullmatch(SECRET_NAME, name):
+        raise bad("اسم السر: حروف إنجليزية وأرقام و _ . - بس")
+    store_for(request.app.state.settings).set(name, body.value)
+    audit.record(db, "secret.set", actor_id=p.user.id, entity="secret", entity_id=name, ip=client_ip(request))
+    db.commit()
+    return {"name": name, "stored": True}
+
+
+@router.delete("/secrets/{name}")
+def delete_secret(name: str, request: Request, p: Principal = Depends(require("system:manage_secrets")),
+                  db: Session = Depends(get_db)) -> dict:
+    from ..secrets_store import store_for
+    if not store_for(request.app.state.settings).delete(name):
+        raise not_found("السر غير موجود")
+    audit.record(db, "secret.deleted", actor_id=p.user.id, entity="secret", entity_id=name, ip=client_ip(request))
+    db.commit()
+    return {"ok": True}
+
+
+# --- local Excel workbook as a connector's data source
+def workbooks_dir(settings) -> Path:  # noqa: ANN001
+    d = Path(settings.data_dir) / "workbooks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@router.post("/integrations/{key}/workbook")
+async def upload_workbook(key: str, request: Request, file: UploadFile = File(...),
+                          p: Principal = Depends(require("system:manage_integration")),
+                          db: Session = Depends(get_db)) -> dict:
+    cfg = db.scalar(select(IntegrationConfig).where(IntegrationConfig.key == key))
+    if cfg is None:
+        raise not_found("موصل غير موجود")
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise bad("الملف لازم يكون Excel بامتداد xlsx")
+    data = await file.read(20 * 1024 * 1024 + 1)
+    if len(data) > 20 * 1024 * 1024:
+        raise bad("الملف أكبر من 20 ميجا")
+    try:
+        from openpyxl import load_workbook
+        import io as _io
+        load_workbook(_io.BytesIO(data))
+    except Exception:  # noqa: BLE001
+        raise bad("الملف مش Excel صالح") from None
+    name = f"{key}.xlsx"
+    (workbooks_dir(request.app.state.settings) / name).write_bytes(data)
+    cfg.mode, cfg.source_ref, cfg.status, cfg.last_error = "local_xlsx", name, "pending_first_sync", ""
+    cfg.version += 1
+    audit.record(db, "integration.workbook_uploaded", actor_id=p.user.id, entity="integration", entity_id=key,
+                 details={"file": file.filename, "size": len(data)}, ip=client_ip(request))
+    db.commit()
+    return {"key": key, "mode": cfg.mode, "status": cfg.status}
+
+
+@router.get("/integrations/{key}/workbook")
+def download_workbook(key: str, request: Request, _: Principal = Depends(require("system:view")),
+                      db: Session = Depends(get_db)):  # noqa: ANN201
+    from fastapi.responses import FileResponse
+    cfg = db.scalar(select(IntegrationConfig).where(IntegrationConfig.key == key))
+    if cfg is None or cfg.mode != "local_xlsx" or not cfg.source_ref:
+        raise not_found("مفيش ملف Excel محلي لهذا الموصل")
+    path = workbooks_dir(request.app.state.settings) / cfg.source_ref
+    if not path.is_file():
+        raise not_found("الملف مش موجود")
+    return FileResponse(path, filename=f"{key}.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @router.get("/sync/conflicts")
@@ -432,8 +530,9 @@ def worker_tick(app_state, transport=None) -> dict:  # noqa: ANN001
         summary["scripts"] = ran
         syncs = {}
         for cfg in db.scalars(select(IntegrationConfig).where(IntegrationConfig.enabled.is_(True),
-                                                              IntegrationConfig.mode == "sheets")):
-            syncs[cfg.key] = run_connector(db, cfg, Path(settings.data_dir) / "secrets", transport).get("status")
+                                                              IntegrationConfig.mode.in_(("sheets", "local_xlsx")))):
+            syncs[cfg.key] = run_connector(db, cfg, Path(settings.data_dir) / "secrets", transport,
+                                           secret_lookup=_secret_lookup(settings)).get("status")
             db.commit()
         summary["sync"] = syncs
         hb = db.get(WorkerHeartbeat, "main")

@@ -48,6 +48,7 @@ def _user_dict(u: User) -> dict:
     return {
         "id": u.id, "email": u.email, "name": u.name, "active": u.active,
         "role": {"key": u.role.key, "name_ar": u.role.name_ar}, "all_companies": u.all_companies,
+        "mfa_enabled": bool(u.mfa_enabled),
         "scopes": [{"company_id": s.company_id, "branch_id": s.branch_id, "department_id": s.department_id}
                    for s in u.scopes],
         "created_at": u.created_at.isoformat() if u.created_at else None,
@@ -167,6 +168,22 @@ def update_user(user_id: str, body: UserPatch, request: Request, p: Principal = 
     db.commit()
     db.refresh(u)
     return _user_dict(u)
+
+
+@router.post("/users/{user_id}/mfa-reset")
+def mfa_reset(user_id: str, request: Request, p: Principal = Depends(require("system:manage_users")),
+              db: Session = Depends(get_db)) -> dict:
+    """Admin recovery when a user lost their phone. The user must set MFA up again."""
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "مستخدم غير موجود")
+    if u.role.key == "super_admin" and p.user.role.key != "super_admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "متاح لـ Super Admin فقط")
+    u.mfa_enabled, u.mfa_secret_enc, u.mfa_pending_enc, u.mfa_last_counter = False, "", "", 0
+    _revoke_sessions(db, u.id)
+    audit.record(db, "user.mfa_reset", actor_id=p.user.id, entity="user", entity_id=u.id, ip=client_ip(request))
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/users/{user_id}/reset-password")

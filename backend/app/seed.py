@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .models import IntegrationConfig, Role, RolePermission, SchemaVersion
 from .rbac import DEFAULT_ROLES, SYSTEM_ROLES
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # (key, module, title_ar, provider, mode)
 CONNECTORS: list[tuple[str, str, str, str, str]] = [
@@ -47,8 +47,14 @@ def seed(db: Session) -> None:
             role.permissions = [RolePermission(permission=p) for p in perms]
             db.add(role)
         elif upgrading and key not in SYSTEM_ROLES:
-            # schema upgrade: default roles move to the new default permission set
-            role.permissions = [RolePermission(permission=p) for p in perms]
+            # schema upgrade: default roles move to the new default permission set — as a diff, so unchanged
+            # permissions are kept (replacing the whole list would insert duplicates before deleting the old rows)
+            want = set(perms)
+            for rp in list(role.permissions):
+                if rp.permission not in want:
+                    role.permissions.remove(rp)
+            have = {rp.permission for rp in role.permissions}
+            role.permissions.extend(RolePermission(permission=p) for p in perms if p not in have)
         elif key in SYSTEM_ROLES:
             # super_admin always holds the full catalog (new permissions get added on upgrade)
             have = {rp.permission for rp in role.permissions}
@@ -61,4 +67,6 @@ def seed(db: Session) -> None:
     seed_categories(db)
     seed_lookups(db)
     seed_finance(db)
+    from .modules.lists import seed_lists
+    seed_lists(db)
     db.commit()

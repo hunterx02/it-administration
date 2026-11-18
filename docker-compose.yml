@@ -1,0 +1,22 @@
+# VPS: put this behind an HTTPS reverse proxy (Caddy/Nginx). See docs/README_DEPLOY_VPS.md
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: backend/.env          # ITADM_SECRET_KEY + ITADM_COOKIE_SECURE=true (never commit this file)
+    volumes:
+      - itadm-data:/data
+      - itadm-secrets:/secrets
+    ports:
+      - "127.0.0.1:8000:8000"       # only the reverse proxy should reach it
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: backend/.env
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - itadm-data:/data
+      - itadm-secrets:/secrets
+volumes:
+  itadm-data:
+  itadm-secrets:

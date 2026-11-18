@@ -33,7 +33,8 @@ from ..models import Company, Department, new_id, utcnow
 from .assets import ALLOCATION as ASSET_ALLOCATION
 from .assets import Asset, do_return, employee_assets
 from .files import FileObject, require_file
-from .people import EMPLOYEE_PUBLIC_FIELDS, Employee, EmployeeSensitive, get_employee
+from .mailboxes import Mailbox, employee_mailboxes, suspend_mailbox
+from .people import EMPLOYEE_PUBLIC_FIELDS, Employee, EmployeeSensitive, get_employee, next_employee_code
 from .technical import Sim, employee_sims, sim_return
 
 JOINING_DOCS = {"national_id": "صورة البطاقة", "birth_certificate": "شهادة الميلاد", "photo": "صورة شخصية",
@@ -41,6 +42,7 @@ JOINING_DOCS = {"national_id": "صورة البطاقة", "birth_certificate": "
 ACK_KINDS = {"internal_regulations": "اللائحة الداخلية", "nda": "اتفاقية عدم الإفصاح NDA", "contract": "عقد العمل",
              "custody": "استلام العهدة", "work_start": "إقرار استلام العمل"}
 TEMPLATE_KINDS = {**{k: v for k, v in ACK_KINDS.items() if k != "custody"}, "custody": "نموذج العهدة",
+                  "computer_custody": "بيان عهدة الحاسب الآلي", "other_custody": "نموذج العهدة الأخرى (المنفصلة)",
                   "clearance": "نموذج إخلاء الطرف"}
 DEFAULT_AUTHORITIES = ["مدير الإدارة / القسم", "تقنية المعلومات", "مدير المكتب", "المالية / الحسابات",
                        "الموارد البشرية", "الإدارة العليا / المدير التنفيذي"]
@@ -55,6 +57,8 @@ POLICY = {  # configurable, NOT approved policies (DECISIONS_AND_GAPS_RC1)
     "external_notifications_enabled": False,
     "auto_delete_hr_records": False,
     "offboarding_alert_days_before": 1,
+    "clearance_sequential": True,  # the six authorities sign in their configured order
+
 }
 
 
@@ -141,6 +145,7 @@ class ITTask(Base):
     verified_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     notes: Mapped[str] = mapped_column(Text, default="")
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    evidence_file_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -402,6 +407,7 @@ class TaskUpdate(BaseModel):
     status: str = Field(pattern="^(done|verified|skipped)$")
     ref: str | None = None
     notes: str = ""
+    evidence_file_id: str | None = None  # proof of execution (screenshot / signed form) — required before IT approval
 
 
 class TemplateIn(BaseModel):
@@ -429,7 +435,7 @@ class OffboardIn(BaseModel):
 
 
 class ITCheckIn(BaseModel):
-    item_type: str = Field(pattern="^(asset|sim|account|other)$")
+    item_type: str = Field(pattern="^(asset|sim|mailbox|account|other)$")
     item_ref: str = Field(min_length=1)
     result: str = Field(pattern="^(returned|damaged|missing|deprovisioned|pending_verification|not_applicable)$")
     serial_checked: bool = False
@@ -510,7 +516,9 @@ def create_employee(body: EmployeeIn, request: Request, p: Principal = Depends(r
     get_company(db, body.company_id)
     if body.employee_code and db.scalar(select(Employee).where(Employee.employee_code == body.employee_code)):
         raise conflict("الكود الوظيفي مستخدم")
-    e = Employee(**body.model_dump(), status="active")
+    data = body.model_dump()
+    data["employee_code"] = (data.get("employee_code") or "").strip() or next_employee_code(db, body.company_id)
+    e = Employee(**data, status="active")
     db.add(e)
     db.flush()
     ensure_joining_rows(db, e)
@@ -520,12 +528,33 @@ def create_employee(body: EmployeeIn, request: Request, p: Principal = Depends(r
     return employee_out(e, p, db)
 
 
+@router.post("/employees/assign-codes")
+def assign_missing_codes(request: Request, company_id: str | None = None,
+                         p: Principal = Depends(require("employees:edit")), db: Session = Depends(get_db)) -> dict:
+    """Give an automatic code to every employee that has none (existing codes are never changed)."""
+    s = scope_filter(select(Employee), p, Employee.company_id).where(
+        (Employee.employee_code.is_(None)) | (Employee.employee_code == "")).order_by(Employee.created_at)
+    if company_id:
+        s = s.where(Employee.company_id == company_id)
+    done = []
+    for e in db.scalars(s):
+        e.employee_code = next_employee_code(db, e.company_id)
+        e.version += 1
+        db.flush()
+        done.append(e.employee_code)
+    audit.record(db, "employee.codes_assigned", actor_id=p.user.id, entity="employee", entity_id="bulk",
+                 details={"count": len(done)}, ip=client_ip(request))
+    db.commit()
+    return {"assigned": len(done), "codes": done[:50]}
+
+
 @router.get("/employees/{emp_id}")
 def employee_detail(emp_id: str, p: Principal = Depends(require("employees:view")),
                     db: Session = Depends(get_db)) -> dict:
     e = _load_emp(db, p, emp_id)
     d = employee_out(e, p, db)
     d["custody"] = current_custody(db, e.id)
+    d["mailboxes"] = employee_mailboxes(db, e.id) if p.can("technical:view") else []
     docs = list(db.scalars(select(JoiningDocument).where(JoiningDocument.employee_id == e.id)))
     d["joining_documents"] = [{"doc_type": j.doc_type, "label": JOINING_DOCS.get(j.doc_type, j.doc_type),
                                "status": j.status, "file_id": j.file_id if p.can("employees:view_sensitive") else None}
@@ -715,7 +744,8 @@ def final_decision(app_id: str, body: DecisionIn, request: Request,
                     outcome=outcome, reason=body.reason, decided_by=p.user.id))
     result: dict = {"outcome": outcome}
     if outcome == "onboarding":
-        e = Employee(company_id=a.company_id, full_name=a.full_name, gender=a.gender, email="", phone=a.phone,
+        e = Employee(company_id=a.company_id, employee_code=next_employee_code(db, a.company_id),
+                     full_name=a.full_name, gender=a.gender, email="", phone=a.phone,
                      job_title=body.job_title or a.position, department_id=body.department_id,
                      branch_id=body.branch_id, status="onboarding", hire_date=body.start_date, application_id=a.id)
         db.add(e)
@@ -791,7 +821,7 @@ def onboarding_detail(ob_id: str, p: Principal = Depends(require("employees:view
     return row(ob, ["id", "employee_id", "company_id", "start_date", "status", "completed_at"]) | {
         "employee": employee_out(e, p, db),
         "tasks": [row(t, ["id", "kind", "description", "ref", "status", "done_by", "verified_by", "notes",
-                          "due_date"]) | {"kind_ar": IT_TASK_KINDS.get(t.kind, t.kind)} for t in chk["tasks"]],
+                          "due_date", "evidence_file_id"]) | {"kind_ar": IT_TASK_KINDS.get(t.kind, t.kind)} for t in chk["tasks"]],
         "joining_documents": [{"doc_type": d.doc_type, "label": JOINING_DOCS[d.doc_type], "status": d.status}
                               for d in chk["docs"]],
         "acks": sorted(chk["acks"]), "missing": chk["missing"], "custody": current_custody(db, e.id),
@@ -829,6 +859,11 @@ def update_task(task_id: str, body: TaskUpdate, request: Request,
         raise conflict("لازم المهمة تتنفذ (done) قبل اعتمادها")
     if body.status == "skipped" and len(body.notes.strip()) < 3:
         raise bad("اكتب سبب تخطي المهمة")
+    if body.evidence_file_id:
+        require_file(db, body.evidence_file_id)
+        t.evidence_file_id = body.evidence_file_id
+    if body.status == "verified" and not t.evidence_file_id:
+        raise conflict("ارفع دليل التنفيذ (صورة / ملف) قبل اعتماد المهمة")  # execute -> evidence -> approve
     if body.ref is not None:
         if "password" in body.ref.lower() or "pass:" in body.ref.lower():
             raise bad("ممنوع كتابة كلمات مرور — اكتب مرجع فقط")
@@ -841,7 +876,7 @@ def update_task(task_id: str, body: TaskUpdate, request: Request,
     audit.record(db, f"it_task.{body.status}", actor_id=p.user.id, entity="onboarding", entity_id=ob.id,
                  company_id=ob.company_id, details={"task": t.kind}, ip=client_ip(request))
     db.commit()
-    return row(t, ["id", "kind", "description", "ref", "status", "notes"])
+    return row(t, ["id", "kind", "description", "ref", "status", "notes", "evidence_file_id"])
 
 
 @router.post("/journey/onboarding/{ob_id}/complete")
@@ -972,6 +1007,7 @@ def offboarding_out(db: Session, o: Offboarding) -> dict:
                 "printed_at", "signed_scan_file_id", "closed_at"])
     d["employee_name"], d["job_title"] = e.full_name, e.job_title
     d["custody"] = current_custody(db, e.id)
+    d["mailboxes"] = employee_mailboxes(db, e.id)
     d["checks"] = [row(c, ["id", "item_type", "item_ref", "result", "serial_checked", "notes", "at"])
                    for c in db.scalars(select(ITCheck).where(ITCheck.offboarding_id == o.id).order_by(ITCheck.at))]
     d["authorities"] = [row(a, ["id", "order", "authority", "status", "signer_name", "signed_date", "notes"])
@@ -1041,6 +1077,13 @@ def it_check(off_id: str, body: ITCheckIn, request: Request, p: Principal = Depe
         if body.result not in ("returned", "damaged", "missing"):
             raise bad("نتيجة الشريحة: returned / damaged / missing")
         sim_return(db, s, body.result, p.user.id, f"offboarding {o.id}. {body.notes}".strip())
+    elif body.item_type == "mailbox":
+        mb = db.get(Mailbox, body.item_ref)
+        if mb is None or mb.employee_id != o.employee_id:
+            raise bad("الإيميل مش مربوط بالموظف ده")
+        if body.result != "deprovisioned":
+            raise bad("نتيجة الإيميل: deprovisioned (إيقاف الحساب)")
+        suspend_mailbox(db, mb, p.user.id, f"إخلاء طرف {o.id}. {body.notes}".strip())
     c = ITCheck(offboarding_id=o.id, item_type=body.item_type, item_ref=body.item_ref, result=body.result,
                 serial_checked=body.serial_checked, notes=body.notes, checked_by=p.user.id)
     db.add(c)
@@ -1061,8 +1104,12 @@ def it_approve(off_id: str, request: Request, p: Principal = Depends(require("em
     cust = current_custody(db, o.employee_id)
     if cust["assets"] or cust["sims"]:
         raise conflict("لسه في عهد مع الموظف لم تُراجع (أصول/شرائح)")
+    active_mail = employee_mailboxes(db, o.employee_id, active_only=True)
+    if active_mail:
+        raise conflict("لسه في إيميلات نشطة باسم الموظف — أوقفها أو انقلها: "
+                       + ", ".join(m["address"] for m in active_mail))
     checks = list(db.scalars(select(ITCheck).where(ITCheck.offboarding_id == o.id)))
-    if not any(c.item_type == "account" for c in checks):
+    if not any(c.item_type in ("account", "mailbox") for c in checks):
         raise bad("سجّل مراجعة إلغاء الحسابات (account) قبل الاعتماد")
     pending = [c.item_ref for c in checks if c.result == "pending_verification"]
     if pending:
@@ -1083,35 +1130,68 @@ def clearance_print(off_id: str, request: Request, p: Principal = Depends(requir
     if o.status == "it_review":
         raise conflict("لازم IT يعتمد الأول قبل طباعة الإخلاء")
     e = db.get(Employee, o.employee_id)
-    company = db.get(Company, o.company_id)
     dep = db.get(Department, e.department_id) if e.department_id else None
+    sens = db.get(EmployeeSensitive, e.id) if p.can("employees:view_sensitive") else None
     esc = html.escape
-    rows = "".join(
-        f"<tr><td>{a.order}</td><td>{esc(a.authority)}</td><td></td><td></td><td>☐ Clear &nbsp; ☐ Not Clear</td>"
-        f"<td></td></tr>"
-        for a in db.scalars(select(ClearanceApproval).where(ClearanceApproval.offboarding_id == o.id)
+    checks = list(db.scalars(select(ITCheck).where(ITCheck.offboarding_id == o.id)))
+    types = {c.item_type for c in checks}
+    box = lambda on: f'<span class="chk">{"✓" if on else ""}</span>'  # noqa: E731
+    dots = lambda v, w=150: f'<span class="v" style="min-width:{w}px">{esc(str(v)) if v else "&nbsp;"}</span>'  # noqa: E731
+    # F05 sections in the company's order (authorities 1..6). Extra tick-boxes per section, as on the paper form.
+    english = ["Employ Department", "I T Department", "Office Manager", "Financial / the accounts",
+               "Personnel Department", "Higher Management"]
+    extras = {2: f"{box(bool(types & {'sim', 'mailbox'}))} وسائل الاتصال telecom &nbsp;&nbsp; "
+                 f"{box('asset' in types)} حاسبات آلية Computers",
+              4: f"{box(False)} السلف Loans &nbsp;&nbsp; {box(False)} العهدة المالية Financial covenant",
+              5: f"{box(False)} البطاقة الوظيفية Emp. Card &nbsp;&nbsp; {box(False)} المفاتيح والاقفال Keys and locks"
+                 f"<div style='margin-top:6px'>{box(False)} أخــرى حـــــدد : {dots('', 300)} Reason</div>"}
+    auths = list(db.scalars(select(ClearanceApproval).where(ClearanceApproval.offboarding_id == o.id)
                             .order_by(ClearanceApproval.order)))
-    checks = "".join(f"<li>{esc(c.item_type)} — {esc(c.item_ref)}: {esc(c.result)}</li>"
-                     for c in db.scalars(select(ITCheck).where(ITCheck.offboarding_id == o.id)))
+    sections, top = [], None
+    for a in auths:
+        if a.order == 6 or "العليا" in a.authority:
+            top = a
+            continue
+        en = english[a.order - 1] if 0 < a.order <= len(english) else ""
+        sections.append(
+            f"<div class=sec2><div class=st>* {esc(a.authority)} : <span dir=ltr>{en}</span>:</div>"
+            + (f"<div class=ex>{extras[a.order]}</div>" if a.order in extras else "")
+            + f"<div>الاســم : {dots(a.signer_name)} Name &nbsp; التوقيع : {dots('', 120)} Signature &nbsp; "
+              f"التاريخ : {dots(a.signed_date.strftime('%d/%m/%Y') if a.signed_date else '', 90)} Date</div>"
+            + f"<div class=ex>{box(a.status == 'clear')} يخـلى طـرفـه Clear &nbsp;&nbsp; {box(a.status == 'not_clear')} "
+              f"لا يخلى طرفه Not Clear &nbsp; حـــــدد :</div><div>{dots(a.notes, 520)} : Reason</div></div>")
+    reason = o.reason or ""
+    other_reason = "" if reason.strip() in ("إجازة", "نهاية خدمة", "") else reason
+    css = (".cl{font-size:13px}.cl h2{font-size:15px;text-decoration:underline;margin:12px 0 6px}"
+           ".cl .frame{border:1px solid #000;padding:10px 12px}.cl .v{border-bottom:1px dotted #000;display:inline-block;"
+           "padding:0 4px;font-weight:700}.cl .sec2{border-bottom:1px solid #000;padding:10px 4px;line-height:2}"
+           ".cl .sec2:last-child{border-bottom:0}.cl .st{font-weight:700;text-decoration:underline}"
+           ".cl .ex{text-align:center}.chk{display:inline-block;width:13px;height:13px;border:1px solid #000;"
+           "vertical-align:middle;text-align:center;line-height:11px;font-size:11px;margin-inline-end:3px}")
+    body = (f"<div class=cl><div style='font-weight:700;text-decoration:underline'>إخـلاء طــرف Clearance Form</div>"
+            f"<h2>1- بيانات الموظف - Employ Data</h2><div class=frame style='line-height:2.2'>"
+            f"<div>الاســم: {dots(e.full_name, 200)} Name: &nbsp; الرقم الوظيفي: {dots(e.employee_code)} No: &nbsp; "
+            f"الإدارة: {dots('', 110)}</div>"
+            f"<div>الـقـسـم: {dots(dep.name if dep else '')} Section: &nbsp; مسمى الوظيفة: {dots(e.job_title)} Title:</div>"
+            f"<div>الرقم القومي: {dots(sens.national_id if sens else '', 230)} National ID</div>"
+            f"<div>سبب إخلاء الطرف: {box(reason.strip() == 'إجازة')} إجازة Vacation &nbsp; "
+            f"{box(reason.strip() == 'نهاية خدمة')} نهاية خدمة Exit &nbsp; {esc(other_reason)} : Clearance Reason</div>"
+            f"<div class=muted>آخر يوم عمل: {o.last_day.strftime('%d/%m/%Y')} — مراجعة IT معتمدة إلكترونيًا "
+            f"{iso(o.it_approved_at)[:10] if o.it_approved_at else ''}</div></div>"
+            f"<h2>2- الجهات ذات العلاقة - Related Managements</h2><div class=frame>{''.join(sections)}</div>"
+            f"<h2>الإدارة العليا - Higher Management</h2><div class=frame style='text-align:center;padding:22px'>"
+            f"<b>المدير التنفيذي :</b> {dots(top.signer_name if top else '', 200)} <b>:Signature</b>"
+            + (f"<div class=ex style='margin-top:8px'>{box(top.status == 'clear')} Clear &nbsp; "
+               f"{box(top.status == 'not_clear')} Not Clear</div>" if top and top.status != 'pending' else "")
+            + f"</div><p class=muted>رقم الملف: {o.id} — طُبع {now().strftime('%Y-%m-%d %H:%M')} UTC. الورقة دي مش "
+              f"إخلاء نهائي إلا بعد توقيع كل الجهات ورفع النسخة الموقعة.</p></div>")
     if o.printed_at is None:
         o.printed_at = now()
     audit.record(db, "offboarding.clearance_printed", actor_id=p.user.id, entity="offboarding", entity_id=o.id,
-                 company_id=o.company_id, ip=client_ip(request))
+                 company_id=o.company_id, details={"sensitive": sens is not None}, ip=client_ip(request))
     db.commit()
-    page = f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>إخلاء طرف</title>
-<style>body{{font-family:Cairo,Tahoma,sans-serif;margin:24px;color:#000}}h1{{font-size:20px;text-align:center}}
-table{{width:100%;border-collapse:collapse;margin-top:12px}}td,th{{border:1px solid #444;padding:8px;font-size:13px}}
-.meta td{{border:0;padding:3px}}small{{color:#444}}@media print{{button{{display:none}}}}</style></head><body>
-<button onclick="print()">طباعة</button>
-<h1>نموذج إخلاء طرف</h1><p style="text-align:center">{esc(company.name if company else '')}</p>
-<table class="meta"><tr><td>الاسم: <b>{esc(e.full_name)}</b></td><td>الكود الوظيفي: {esc(e.employee_code or '')}</td></tr>
-<tr><td>الإدارة/القسم: {esc(dep.name if dep else '')}</td><td>المسمى الوظيفي: {esc(e.job_title)}</td></tr>
-<tr><td>آخر يوم عمل: {o.last_day.isoformat()}</td><td>سبب الإخلاء: {esc(o.reason)}</td></tr></table>
-<h3>مراجعة تقنية المعلومات (معتمدة إلكترونيًا بتاريخ {iso(o.it_approved_at)[:10]})</h3><ul>{checks}</ul>
-<table><tr><th>#</th><th>الجهة</th><th>الاسم</th><th>التوقيع</th><th>الحالة</th><th>التاريخ / ملاحظات</th></tr>{rows}</table>
-<p><small>رقم الملف: {o.id} — تمت الطباعة {now().strftime('%Y-%m-%d %H:%M')} UTC. هذه الورقة لا تُعد إخلاءً نهائيًا
-إلا بعد توقيع جميع الجهات ورفع النسخة الموقعة ومراجعة الموارد البشرية.</small></p></body></html>"""
-    return HTMLResponse(page)
+    from .printing import doc_page
+    return HTMLResponse(doc_page(db, o.company_id, "إخلاء طرف " + e.full_name, body, css))
 
 
 @router.post("/journey/offboarding/{off_id}/authorities/{auth_id}")
@@ -1127,6 +1207,13 @@ def set_authority(off_id: str, auth_id: str, body: AuthorityIn, request: Request
         raise bad("سجّل اسم الموقّع وتاريخ التوقيع الورقي")
     if body.status == "not_clear" and len(body.notes.strip()) < 3:
         raise bad("اكتب سبب Not Clear")
+    if body.status != "pending" and POLICY["clearance_sequential"]:
+        earlier = db.scalar(select(ClearanceApproval).where(ClearanceApproval.offboarding_id == o.id,
+                                                            ClearanceApproval.order < a.order,
+                                                            ClearanceApproval.status == "pending")
+                            .order_by(ClearanceApproval.order).limit(1))
+        if earlier is not None:
+            raise conflict(f"التوقيعات بالترتيب — لازم «{earlier.authority}» يوقّع الأول")
     a.status, a.signer_name, a.signed_date, a.notes, a.recorded_by = (body.status, body.signer_name,
                                                                       body.signed_date, body.notes, p.user.id)
     audit.record(db, "offboarding.authority", actor_id=p.user.id, entity="offboarding", entity_id=o.id,

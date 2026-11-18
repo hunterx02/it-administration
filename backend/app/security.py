@@ -38,6 +38,36 @@ def password_problems(password: str) -> list[str]:
     return problems
 
 
+def totp_new_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def totp_code(secret_b32: str, counter: int) -> str:
+    import struct
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8))
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    return f"{(int.from_bytes(digest[off:off + 4], 'big') & 0x7FFFFFFF) % 1_000_000:06d}"
+
+
+def totp_verify(secret_b32: str, code: str, last_counter: int | None = None, at: float | None = None) -> int | None:
+    """Returns the matched time-step counter (±1 step window) or None. Rejects a counter already used (replay)."""
+    import time
+    code = "".join(ch for ch in str(code or "") if ch.isdigit())
+    if len(code) != 6:
+        return None
+    now = int((at if at is not None else time.time()) // 30)
+    for c in (now - 1, now, now + 1):
+        if hmac.compare_digest(totp_code(secret_b32, c), code) and (last_counter is None or c > last_counter):
+            return c
+    return None
+
+
+def totp_uri(secret_b32: str, account: str, issuer: str = "IT Administration") -> str:
+    from urllib.parse import quote
+    return f"otpauth://totp/{quote(issuer)}:{quote(account)}?secret={secret_b32}&issuer={quote(issuer)}&digits=6&period=30"
+
+
 def new_session_token() -> tuple[str, str]:
     """Returns (token for the cookie, sha256 hex stored in DB)."""
     token = secrets.token_urlsafe(32)

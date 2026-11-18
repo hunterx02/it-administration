@@ -93,6 +93,9 @@ def legacy_import(body: LegacyImportIn, request: Request, p: Principal = Depends
         code = m.get("empNo") or None
         if code and db.scalar(select(Employee).where(Employee.employee_code == code)):
             code = None
+        if not code:
+            from .people import next_employee_code
+            code = next_employee_code(db, cid)
         e = Employee(company_id=cid, full_name=m.get("name") or "بدون اسم", job_title=m.get("role") or "",
                      department_id=dept_id(cid, m.get("dept")), email=m.get("email") or "",
                      phone=m.get("phone") or "", employee_code=code, hire_date=_d(m.get("startDate")),

@@ -107,6 +107,7 @@ class Line(Base):
     landline_number: Mapped[str] = mapped_column(String(40), default="")
     provider: Mapped[str] = mapped_column(String(80), default="")
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)  # one of the "3 main lines" on the dashboard
+    update_method: Mapped[str] = mapped_column(String(20), default="manual")  # manual | we_extension | script | api
     quota_gb: Mapped[float | None] = mapped_column(Float, nullable=True)
     used_gb: Mapped[float | None] = mapped_column(Float, nullable=True)
     remaining_gb: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -240,7 +241,8 @@ SIM_FIELDS = ["id", "code", "country", "company_id", "department_id", "name", "n
               "charge_owner", "agent_details", "phone_asset_id", "backup_email", "last_backup_at",
               "backup_interval_days", "last_payment", "period_value", "period_unit", "alert_days", "last_handover",
               "notes", "source", "version"]
-LINE_FIELDS = ["id", "code", "company_id", "branch_id", "name", "landline_number", "provider", "is_primary",
+UPDATE_METHODS = {"manual": "يدوي", "we_extension": "إضافة WE", "script": "سكريبت", "api": "API"}
+LINE_FIELDS = ["id", "code", "company_id", "branch_id", "name", "landline_number", "provider", "is_primary", "update_method",
                "quota_gb", "used_gb", "remaining_gb", "last_reading_at", "last_reading_source", "warn_gb",
                "critical_gb", "net_last_payment", "net_period_value", "net_period_unit", "net_alert_days",
                "land_last_payment", "land_period_value", "land_period_unit", "land_alert_days", "notes", "version"]
@@ -350,6 +352,7 @@ class LineIn(BaseModel):
     landline_number: str = ""
     provider: str = ""
     is_primary: bool = False
+    update_method: str = Field(default="manual", pattern="^(manual|we_extension|script|api)$")
     quota_gb: float | None = Field(default=None, ge=0)
     warn_gb: float | None = Field(default=None, ge=0)
     critical_gb: float | None = Field(default=None, ge=0)
@@ -371,6 +374,7 @@ class LinePatch(BaseModel):
     landline_number: str | None = None
     provider: str | None = None
     is_primary: bool | None = None
+    update_method: str | None = Field(default=None, pattern="^(manual|we_extension|script|api)$")
     quota_gb: float | None = Field(default=None, ge=0)
     warn_gb: float | None = Field(default=None, ge=0)
     critical_gb: float | None = Field(default=None, ge=0)
@@ -569,7 +573,8 @@ def meta(_: Principal = Depends(require("technical:view")), db: Session = Depend
     for lk in db.scalars(select(Lookup).where(Lookup.list_key.in_(list(DEFAULT_LOOKUPS)), Lookup.active.is_(True))
                          .order_by(Lookup.sort, Lookup.value)):
         lists[lk.list_key].append(lk.value)
-    return {"lists": lists, "allocation": ALLOCATION, "network": NETWORK, "period_units": {"days": "أيام",
+    return {"lists": lists, "allocation": ALLOCATION, "network": NETWORK, "update_methods": UPDATE_METHODS,
+            "period_units": {"days": "أيام",
             "months": "شهور"}, "usage": USAGE_AR, "due": DUE_AR}
 
 

@@ -36,6 +36,8 @@ CATEGORIES: dict[str, tuple[str, bool]] = {
     "paper_approval": ("finance:view", False),
     "receipt": ("finance:view", False),
     "script": ("system:manage_integration", False),
+    "letterhead": ("dashboard:view", False),                    # company header/footer images for printouts
+    "import": ("dashboard:view", False),
     "other": ("dashboard:view", False),
 }
 
@@ -111,6 +113,8 @@ async def upload(request: Request, category: str = Form(...), company_id: str | 
                  file: UploadFile = File(...), p: Principal = Depends(current_principal),
                  db: Session = Depends(get_db)) -> dict:
     perm = CATEGORIES.get(category, ("system:edit", False))[0]
+    if category == "letterhead":
+        perm = "system:edit"  # anyone may view it on printouts, only admins upload
     if not p.can(perm):
         raise forbid("ليس لديك صلاحية رفع هذا النوع من الملفات")
     if company_id:

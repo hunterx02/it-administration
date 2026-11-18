@@ -77,6 +77,47 @@
   };
   App.confirm = (title, text) => new Promise(res => App.modal({ title, body: `<p>${esc(text)}</p>`, actions: [{ label: 'تأكيد', primary: true, onClick: () => res(true) }] }));
 
+  /* ---- editable dropdowns: every list gets ➕ add / ✏️ rename / 🗑 remove next to it (when permitted) ---- */
+  App.lookups = {};
+  App.lookupValues = key => ((App.lookups[key] || {}).items || []).filter(i => i.active !== false).map(i => i.value);
+  App.loadLookups = async () => { try { (await App.get('/api/lookups')).forEach(l => { App.lookups[l.key] = l; }); } catch (e) { /* optional */ } };
+  function pickBtns(f) {
+    const kind = f.lookup ? 'lookup' : f.pick;
+    const can = { lookup: () => (App.lookups[f.lookup] || {}).can_edit, department: () => App.can('system:edit'), employee: () => App.can('employees:create'), supplier: () => App.can('finance:create') }[kind];
+    if (!can || !can()) return '';
+    const full = kind === 'lookup' || kind === 'department';
+    return `<span class="pick-btns" data-kind="${kind}" data-key="${esc(f.lookup || '')}" data-company="${esc(f.company || '')}">
+      <button type="button" class="icon-btn" data-pick="add" title="إضافة جديد" aria-label="إضافة جديد">➕</button>${full ? '<button type="button" class="icon-btn" data-pick="edit" title="تعديل الاسم المختار" aria-label="تعديل">✏️</button><button type="button" class="icon-btn" data-pick="del" title="حذف المختار من القائمة" aria-label="حذف">🗑</button>' : ''}</span>`;
+  }
+  const askText = (title, value) => new Promise(res => App.modal({ title, body: `<label class="field"><span>الاسم</span><input id="askV" value="${esc(value || '')}"></label>`,
+    onOpen: m => { const i = m.querySelector('#askV'); i.focus(); i.select(); i.onkeydown = e => { if (e.key === 'Enter') m.querySelector('[data-a="0"]').click(); }; },
+    actions: [{ label: 'حفظ', primary: true, onClick: m => { const v = m.querySelector('#askV').value.trim(); if (!v) throw new Error('اكتب الاسم'); res(v); } }] }));
+  document.addEventListener('click', async e => {
+    const b = e.target.closest('[data-pick]'); if (!b) return;
+    const box = b.closest('.pick-btns'), sel = box.parentElement.querySelector('select'), kind = box.dataset.kind, key = box.dataset.key, act = b.dataset.pick;
+    const form = b.closest('form') || document;
+    const company = (form.querySelector('[name="company_id"]') || {}).value || box.dataset.company || App.scopeCompany() || (App.companies[0] || {}).id;
+    const setOpt = (value, label) => { let o = Array.from(sel.options).find(x => x.value === value); if (!o) { o = new Option(label, value); sel.add(o); } o.textContent = label; sel.value = value; sel.dispatchEvent(new Event('change', { bubbles: true })); };
+    try {
+      if (kind === 'lookup') {
+        const items = (App.lookups[key] || {}).items || [], cur = items.find(i => i.value === sel.value);
+        if (act === 'add') { const v = await askText('إضافة إلى «' + ((App.lookups[key] || {}).label || '') + '»'); const r = await App.post('/api/lookups/' + key, { value: v }); items.push(r); setOpt(r.value, r.value); }
+        if (act === 'edit') { if (!cur) throw new Error('اختار قيمة الأول'); const v = await askText('تعديل الاسم', cur.value); const r = await App.patch(`/api/lookups/${key}/${cur.id}`, { value: v }); Object.assign(cur, r); const o = sel.selectedOptions[0]; o.value = r.value; o.textContent = r.value; }
+        if (act === 'del') { if (!cur) throw new Error('اختار قيمة الأول'); if (!await App.confirm('حذف من القائمة', `«${cur.value}» هتختفي من الاختيارات الجديدة، والسجلات القديمة هتفضل زي ما هي.`)) return; await App.api('DELETE', `/api/lookups/${key}/${cur.id}`); cur.active = false; sel.selectedOptions[0].remove(); sel.value = ''; }
+      } else if (kind === 'department') {
+        if (!company) throw new Error('اختار الشركة الأول');
+        if (act === 'add') { const v = await askText('قسم جديد'); const r = await App.post(`/api/companies/${company}/departments`, { name: v }); await App.loadCompanies(); setOpt(r.id, r.name); }
+        if (act === 'edit') { if (!sel.value) throw new Error('اختار القسم الأول'); const v = await askText('تعديل اسم القسم', sel.selectedOptions[0].textContent); await App.patch(`/api/companies/${company}/departments/${sel.value}`, { name: v }); await App.loadCompanies(); setOpt(sel.value, v); }
+        if (act === 'del') { if (!sel.value) throw new Error('اختار القسم الأول'); if (!await App.confirm('تعطيل القسم', 'القسم هيختفي من الاختيارات الجديدة، والسجلات القديمة هتفضل مربوطة بيه.')) return; await App.patch(`/api/companies/${company}/departments/${sel.value}`, { active: false }); await App.loadCompanies(); sel.selectedOptions[0].remove(); sel.value = ''; }
+      } else if (kind === 'employee' && act === 'add') {
+        const fields = [{ name: 'full_name', label: 'الاسم', required: true }, { name: 'department_id', label: 'القسم', type: 'department', company }, { name: 'job_title', label: 'الوظيفة', lookup: 'job_title' }];
+        App.formModal('موظف جديد', fields, {}, async d => { d.company_id = company; d.job_title = d.job_title || ''; const r = await App.post('/api/employees', d); App.cache.employees = null; setOpt(r.id, r.full_name); });
+      } else if (kind === 'supplier' && act === 'add') {
+        const v = await askText('مورد جديد'); const r = await App.post('/api/finance/suppliers', { name: v }); App.cache.suppliers = null; setOpt(r.id, r.name);
+      }
+    } catch (err) { App.fail(err); }
+  });
+
   /* form fields: {name,label,type:text|number|date|select|textarea|checkbox|file|company|department|employee|hidden, options, required, hint, full, value} */
   App.field = f => {
     const v = f.value == null ? '' : f.value, req = f.required ? ' required' : '', id = 'f_' + f.name + '_' + Math.random().toString(36).slice(2, 7);
@@ -84,13 +125,23 @@
     const hint = f.hint ? `<small>${esc(f.hint)}</small>` : '';
     if (f.type === 'hidden') return `<input type="hidden" name="${f.name}" value="${esc(v)}">`;
     if (f.type === 'checkbox') return `<label class="field check ${f.full ? 'full' : ''}"><input type="checkbox" name="${f.name}" ${v ? 'checked' : ''}> ${esc(f.label)}</label>`;
+    /* checkgroup: several ticks side by side in one row; value = array of the checked keys */
+    if (f.type === 'checkgroup') {
+      const on = new Set(Array.isArray(v) ? v : String(v || '').split(/[,،]\s*/).filter(Boolean));
+      return `<div class="field full checkgroup" data-group="${esc(f.name)}">${lab}<div class="chk-row">${(f.options || []).map(o => {
+        const [k, l] = Array.isArray(o) ? o : [o, o];
+        return `<label class="chk-pill"><input type="checkbox" name="${esc(f.name)}" value="${esc(k)}" ${on.has(k) || on.has(l) ? 'checked' : ''}><span>${esc(l)}</span></label>`;
+      }).join('')}</div>${hint}</div>`;
+    }
     let input;
     let opts = f.options;
+    if (f.lookup) { const items = App.lookupValues(f.lookup); opts = [['', '—']].concat(items.map(x => [x, x])); if (v && !items.includes(v)) opts.push([v, v + ' (غير موجودة في القائمة)']); }
     if (f.type === 'company') opts = App.companies.map(c => [c.id, c.name]);
-    if (f.type === 'department') opts = [['', '—']].concat(App.departments(f.company).map(d => [d.id, d.name]));
+    if (f.type === 'department') { opts = [['', '—']].concat(App.departments(f.company).filter(d => d.active !== false || d.id === v).map(d => [d.id, d.name])); f.pick = f.pick || 'department'; }
     if (f.type === 'select' || f.type === 'company' || f.type === 'department' || opts) {
       const list = Array.isArray(opts) ? opts : Object.entries(opts || {});
       input = `<select id="${id}" name="${f.name}"${req}>${list.map(o => { const [k, l] = Array.isArray(o) ? o : [o, o]; return `<option value="${esc(k)}" ${String(k) === String(v) ? 'selected' : ''}>${esc(l)}</option>`; }).join('')}</select>`;
+      if (f.lookup || f.pick) input = `<div class="pick-wrap">${input}${pickBtns(f)}</div>`;
     } else if (f.type === 'textarea') input = `<textarea id="${id}" name="${f.name}" rows="3"${req}>${esc(v)}</textarea>`;
     else if (f.type === 'file') input = `<input id="${id}" type="file" name="${f.name}" accept="${esc(f.accept || '.pdf,.png,.jpg,.jpeg,.docx,.xlsx')}"${req}>`;
     else input = `<input id="${id}" type="${f.type || 'text'}" name="${f.name}" value="${esc(v)}"${req}${f.type === 'number' ? ' step="any" dir="ltr"' : ''}${f.ltr ? ' dir="ltr"' : ''}>`;
@@ -100,6 +151,7 @@
   App.readForm = (root, fields) => {
     const out = {};
     fields.forEach(f => {
+      if (f.type === 'checkgroup') { out[f.name] = Array.from(root.querySelectorAll(`[name="${f.name}"]:checked`)).map(x => x.value); return; }
       const el = root.querySelector(`[name="${f.name}"]`); if (!el || f.type === 'file') return;
       if (f.type === 'checkbox') out[f.name] = el.checked;
       else if (f.type === 'number') out[f.name] = el.value === '' ? null : Number(el.value);
@@ -178,6 +230,19 @@
       <text x="${pt(0)[0]}" y="118" text-anchor="middle" class="g3" fill="var(--muted)">0</text><text x="${pt(1)[0]}" y="118" text-anchor="middle" class="g3" fill="var(--muted)">${has ? esc(String(quota)) : ''}</text></svg>`;
   };
 
+  /* Grouped vertical columns. groups: [{label, values:{seriesName: number}}], series: [{name, color}] */
+  App.columns = (groups, series, opts) => {
+    opts = opts || {};
+    const max = Math.max(1, ...groups.flatMap(g => series.map(s => Number(g.values[s.name]) || 0)));
+    if (!groups.length || max <= 1 && groups.every(g => series.every(s => !Number(g.values[s.name])))) return '<div class="muted small">لا توجد بيانات في الفترة</div>';
+    const W = 640, H = 220, L = 52, Rp = 10, T = 14, B = 34, iw = W - L - Rp, ih = H - T - B, gw = iw / groups.length, bw = Math.min(26, (gw - 14) / series.length);
+    const Y = v => T + ih - v / max * ih;
+    const grid = [0, .5, 1].map(k => `<line x1="${L}" x2="${W - Rp}" y1="${Y(max * k).toFixed(1)}" y2="${Y(max * k).toFixed(1)}" stroke="var(--border)"/><text x="${L - 6}" y="${(Y(max * k) + 4).toFixed(1)}" text-anchor="end" class="g3" fill="var(--muted)">${num(Math.round(max * k))}</text>`).join('');
+    const bars = groups.map((g, gi) => series.map((s, si) => { const v = Number(g.values[s.name]) || 0, x = L + gi * gw + (gw - bw * series.length) / 2 + si * bw; return `<rect x="${x.toFixed(1)}" y="${Y(v).toFixed(1)}" width="${(bw - 3).toFixed(1)}" height="${(T + ih - Y(v)).toFixed(1)}" rx="3" fill="${s.color}"><title>${esc(g.label)} · ${esc(s.name)}: ${num(v)}${opts.unit ? ' ' + esc(opts.unit) : ''}</title></rect>`; }).join('') + `<text x="${(L + gi * gw + gw / 2).toFixed(1)}" y="${H - 12}" text-anchor="middle" class="g3" fill="var(--muted)">${esc(g.label)}</text>`).join('');
+    const legend = series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join('');
+    return `<svg class="usage-chart" viewBox="0 0 ${W} ${H}" direction="ltr" role="img" aria-label="${esc(opts.label || 'رسم أعمدة')}">${grid}${bars}</svg><div class="gauge-legend">${legend}</div>`;
+  };
+
   /* Remaining-over-time chart with threshold lines. points: [{at, remaining}] oldest -> newest. */
   App.usageChart = (points, { quota, warn, critical, unit } = {}) => {
     unit = unit || 'GB';
@@ -212,15 +277,15 @@
 
   // ------------------------------------------------------------ navigation (M01: 6 groups; sub-pages per approved specs)
   App.NAV = [
-    { group: 'الرئيسية', items: [['dashboard', '🏠', 'نظرة عامة', 'dashboard:view']] },
+    { group: 'الرئيسية', items: [['dashboard', '📊', 'Dashboard', 'dashboard:view']] },
     { group: 'الأصول والعهد', items: [['assets', '💻', 'الأجهزة والموبايلات', 'assets:view'], ['custody', '🔁', 'العهد والحركات', 'assets:view'], ['stock', '📦', 'المخازن والجرد', 'assets:view'], ['maintenance', '🔧', 'الصيانة والضمان', 'assets:view']] },
     { group: 'رحلة الموظف', items: [['employees', '👥', 'الموظفون', 'employees:view'], ['recruitment', '🧑‍💼', 'التوظيف والمقابلات', 'employees:view'], ['onboarding', '🟢', 'التعيينات', 'employees:view'], ['offboarding', '🚪', 'إخلاء الطرف', 'employees:view'], ['documents', '📄', 'المستندات والإقرارات', 'employees:view']] },
-    { group: 'الخدمات التقنية', items: [['renewals', '🔁', 'مركز التجديدات', 'technical:view'], ['lines', '🌐', 'الإنترنت والأرضي', 'technical:view'], ['sims-EG', '🇪🇬', 'الشرائح المصرية', 'technical:view'], ['sims-SA', '🇸🇦', 'الشرائح السعودية', 'technical:view'], ['subscriptions', '🪪', 'الاشتراكات والتراخيص', 'technical:view'], ['security', '🛡️', 'الأمان والنسخ الاحتياطي', 'technical:view']] },
+    { group: 'الخدمات التقنية', items: [['renewals', '🔁', 'مركز التجديدات', 'technical:view'], ['lines', '🌐', 'الإنترنت والأرضي', 'technical:view'], ['sims-EG', '🇪🇬', 'الشرائح المصرية', 'technical:view'], ['sims-SA', '🇸🇦', 'الشرائح السعودية', 'technical:view'], ['subscriptions', '🪪', 'الاشتراكات والتراخيص', 'technical:view'], ['mailboxes', '✉️', 'الإيميلات والحسابات', 'technical:view'], ['security', '🛡️', 'الأمان والنسخ الاحتياطي', 'technical:view']] },
     { group: 'الإدارة والمالية', items: [['suppliers', '🏭', 'الموردون', 'finance:view'], ['purchases', '🛒', 'طلبات الشراء والاستلام', 'finance:view'], ['expenses', '🧾', 'المصروفات والفواتير والمدفوعات', 'finance:view'], ['budgets', '📊', 'الميزانيات والتقارير المالية', 'finance:view']] },
-    { group: 'إدارة النظام', items: [['users', '👤', 'المستخدمون', 'system:manage_users'], ['roles', '🔑', 'الأدوار والصلاحيات', 'system:view'], ['companies', '🏢', 'الشركات والفروع والأقسام', 'system:view'], ['integrations', '🔌', 'الربط والأتمتة', 'system:view'], ['appearance', '🎨', 'المظهر والتخصيص', 'dashboard:view'], ['logs', '🕒', 'السجلات والنسخ الاحتياطي', 'system:view']] },
+    { group: 'إدارة النظام', items: [['users', '👤', 'المستخدمون', 'system:manage_users'], ['roles', '🔑', 'الأدوار والصلاحيات', 'system:view'], ['companies', '🏢', 'الشركات والفروع والأقسام', 'system:view'], ['excel', '📥', 'استيراد وتصدير Excel', 'dashboard:view'], ['lists', '🗂️', 'القوائم والإعدادات', 'dashboard:view'], ['integrations', '🔌', 'الربط والأتمتة', 'system:view'], ['appearance', '🎨', 'المظهر والتخصيص', 'dashboard:view'], ['logs', '🕒', 'السجلات والنسخ الاحتياطي', 'system:view']] },
   ];
   const pagePerm = key => { for (const g of App.NAV) for (const it of g.items) if (it[0] === key) return it[3]; return null; };
-  App.extraPerms = { asset: 'assets:view', employee: 'employees:view', application: 'employees:view', onboard: 'employees:view', offboard: 'employees:view', sim: 'technical:view', line: 'technical:view', subscription: 'technical:view', purchase: 'finance:view', event: 'finance:view', alerts: 'dashboard:view' };
+  App.extraPerms = { asset: 'assets:view', employee: 'employees:view', application: 'employees:view', onboard: 'employees:view', offboard: 'employees:view', sim: 'technical:view', line: 'technical:view', subscription: 'technical:view', mailbox: 'technical:view', purchase: 'finance:view', event: 'finance:view', alerts: 'dashboard:view' };
 
   function buildNav() {
     const closed = store.get('navClosed', {}), cur = App.route().page;
@@ -255,8 +320,42 @@
   App.render = render;
 
   // ------------------------------------------------------------ page header helper with the mandatory «تجهيز تقرير»
-  App.head = (title, sub, actions, reportModule) => `<div class="page-head"><div><h1>${esc(title)}</h1>${sub ? `<p class="sub">${sub}</p>` : ''}</div><div class="actions">${actions || ''}${reportModule && App.can('reports:view') ? `<button class="btn" data-report="${reportModule}">📊 تجهيز تقرير</button>` : ''}</div></div>`;
-  document.addEventListener('click', e => { const b = e.target.closest('[data-report]'); if (b) App.reportModal(b.dataset.report); });
+  /* opts.io = import/export entity key; the module's Google Sheet link button appears automatically */
+  const IO_PERMS = { assets: ['assets:create', 'assets:export'], employees: ['employees:create', 'employees:export'], suppliers: ['finance:create', 'finance:export'], sims: ['technical:create', 'technical:export'], lines: ['technical:create', 'technical:export'], subscriptions: ['technical:create', 'technical:export'], mailboxes: ['technical:create', 'technical:export'] };
+  const SHEET_MODULE = { assets: 'assets', journey: 'employees', technical: 'technical', finance: 'finance' };
+  App.head = (title, sub, actions, reportModule, opts) => {
+    opts = opts || {};
+    const links = (App.cache.links || []).filter(l => l.module === SHEET_MODULE[reportModule]);
+    const sheet = links.map(l => `<a class="btn ghost" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer" title="${esc(l.title_ar)}">📄 افتح الشيت</a>`).join('');
+    const io = opts.io && IO_PERMS[opts.io] ? (App.can(IO_PERMS[opts.io][0]) ? `<button class="btn ghost" data-import="${opts.io}">⬆ استيراد</button>` : '') + (App.can(IO_PERMS[opts.io][1]) ? `<button class="btn ghost" data-export="${opts.io}">⬇ تصدير</button>` : '') : '';
+    return `<div class="page-head"><div><h1>${esc(title)}</h1>${sub ? `<p class="sub">${sub}</p>` : ''}</div><div class="actions">${actions || ''}${sheet}${io}${reportModule && App.can('reports:view') ? `<button class="btn" data-report="${reportModule}">📊 تجهيز تقرير</button>` : ''}</div></div>`;
+  };
+  document.addEventListener('click', e => {
+    const b = e.target.closest('[data-report]'); if (b) return App.reportModal(b.dataset.report);
+    const ex = e.target.closest('[data-export]'); if (ex) return App.modal({ title: 'تصدير', body: '<p>الملف بيطلع بنفس أعمدة الاستيراد — تقدر تعدّل فيه وترجّع تستورده.</p>', actions: [{ label: 'Excel (xlsx)', primary: true, onClick: () => { location.href = `/api/export/${ex.dataset.export}?fmt=xlsx${App.scopeCompany() ? '&company_id=' + App.scopeCompany() : ''}`; } }, { label: 'CSV', onClick: () => { location.href = `/api/export/${ex.dataset.export}?fmt=csv`; } }] });
+    const im = e.target.closest('[data-import]'); if (im) return App.importModal(im.dataset.import);
+  });
+
+  App.importModal = entity => App.modal({ title: 'استيراد بيانات', wide: true,
+    body: `<div class="tabs"><button type="button" class="on" data-src="file">📁 ملف من الجهاز</button><button type="button" data-src="url">🔗 لينك Google Sheet</button></div>
+      <div id="srcFile"><label class="field"><span>ملف Excel أو CSV</span><input type="file" id="impFile" accept=".xlsx,.csv"></label><label class="field"><span>اسم الورقة (اختياري — للملفات اللي فيها أكتر من ورقة)</span><input id="impSheet"></label></div>
+      <div id="srcUrl" hidden><label class="field"><span>لينك الشيت</span><input id="impUrl" dir="ltr" placeholder="https://docs.google.com/spreadsheets/d/..."></label><p class="muted small">لازم الشيت يكون متشارك «Anyone with the link — Viewer». لو خاص، اربطه من «الربط والأتمتة».</p></div>
+      <p class="small"><a href="/api/import/${esc(entity)}/template">⬇ نزّل قالب فاضي بالأعمدة المطلوبة</a> · أول خطوة «معاينة» ومش بتحفظ حاجة.</p><div id="impOut"></div>`,
+    onOpen: m => { m.querySelectorAll('[data-src]').forEach(t => { t.onclick = () => { m.querySelectorAll('[data-src]').forEach(x => x.classList.toggle('on', x === t)); m.querySelector('#srcFile').hidden = t.dataset.src !== 'file'; m.querySelector('#srcUrl').hidden = t.dataset.src !== 'url'; }; }); },
+    actions: [{ label: 'معاينة', keepOpen: true, onClick: m => runImport(m, entity, false) }, { label: 'حفظ الاستيراد', primary: true, keepOpen: true, onClick: m => runImport(m, entity, true) }] });
+  async function runImport(m, entity, commit) {
+    const fd = new FormData(), f = m.querySelector('#impFile').files[0], url = m.querySelector('#impUrl').value.trim(), useUrl = !m.querySelector('#srcUrl').hidden;
+    if (useUrl) { if (!url) throw new Error('حط لينك الشيت'); fd.append('url', url); } else { if (!f) throw new Error('اختار ملف'); fd.append('file', f); fd.append('sheet', m.querySelector('#impSheet').value.trim()); }
+    fd.append('commit', commit ? 'true' : 'false');
+    const out = m.querySelector('#impOut'); App.loading(out);
+    try {
+      const r = await App.api('POST', `/api/import/${entity}`, fd);
+      const ST = { new: ['جديد', 'good'], update: ['تحديث', 'info'], same: ['بدون تغيير', 'muted'], error: ['خطأ', 'bad'] };
+      out.innerHTML = `<div class="notice ${commit ? '' : 'muted'}">${commit ? '✅ اتحفظ' : 'معاينة — لسه ما اتحفظش'}: ${r.total} صف · جديد ${r.counts.new} · تحديث ${r.counts.update} · بدون تغيير ${r.counts.same} · أخطاء ${r.counts.error}</div>` +
+        App.table(r.rows, [{ label: 'صف', key: 'row' }, { label: 'الحالة', render: x => App.badge(ST[x.status][0], ST[x.status][1]) }, { label: 'المفتاح', key: 'key' }, { label: 'التفاصيل', key: 'message' }], { compact: true });
+      if (commit) { App.cache.employees = null; App.render(); }
+    } catch (e) { out.innerHTML = App.errorBox(e); }
+  }
 
   // ------------------------------------------------------------ report builder modal (CROSS addendum)
   App.reportModal = async function (module, preset) {
@@ -327,13 +426,18 @@
     w.innerHTML = `<form class="login-card2" novalidate><h1>IT Administration</h1><p class="muted">تسجيل الدخول</p>
       <label class="field"><span>البريد الإلكتروني</span><input type="email" name="email" autocomplete="username" dir="ltr" required></label>
       <label class="field"><span>كلمة المرور</span><input type="password" name="password" autocomplete="current-password" dir="ltr" required></label>
+      <label class="field" id="otpBox" hidden><span>كود التحقق من تطبيق Authenticator</span><input name="otp" inputmode="numeric" autocomplete="one-time-code" dir="ltr" maxlength="6" placeholder="123456"></label>
       <div class="login-err" role="alert"></div><button class="btn primary block" type="submit">دخول</button>
       <p class="muted small">الحساب الأول بيتعمل من setup.bat. مفيش حسابات تجريبية.</p></form>`;
     document.body.appendChild(w); w.querySelector('[name=email]').focus();
     w.querySelector('form').onsubmit = async e => {
       e.preventDefault(); const f = e.target, err = f.querySelector('.login-err'); err.textContent = '';
-      try { await api('POST', '/api/auth/login', { email: f.email.value, password: f.password.value }, { noAuthRedirect: true }); w.remove(); document.body.classList.remove('locked'); await boot(); }
-      catch (x) { err.textContent = x.message; f.password.select(); }
+      const otpBox = f.querySelector('#otpBox');
+      try { await api('POST', '/api/auth/login', { email: f.email.value, password: f.password.value, otp: otpBox.hidden ? null : f.otp.value.trim() }, { noAuthRedirect: true }); w.remove(); document.body.classList.remove('locked'); await boot(); }
+      catch (x) {
+        if (x.message === 'mfa_required') { otpBox.hidden = false; err.textContent = 'الحساب عليه تحقق بخطوتين — اكتب الكود من تطبيق Authenticator'; f.otp.focus(); return; }
+        err.textContent = x.message; if (otpBox.hidden) f.password.select(); else f.otp.select();
+      }
     };
   };
 
@@ -351,6 +455,8 @@
       cf.hidden = false; cf.onchange = () => { store.set('company', cf.value); render(); };
     } else { cf.hidden = true; store.set('company', ''); }
     if (App.can('assets:view')) { try { App.cache.assetMeta = await App.get('/api/assets/meta'); } catch (e) { /* optional */ } }
+    await App.loadLookups();
+    try { App.cache.links = await App.get('/api/integrations/links'); } catch (e) { App.cache.links = []; }
     buildNav();
     refreshBell(); clearInterval(App._bell); App._bell = setInterval(refreshBell, 60000);
     render();

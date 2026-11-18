@@ -3,10 +3,11 @@ uvicorn[standard]==0.32.1
 sqlalchemy==2.0.36
 python-multipart==0.0.20
 openpyxl==3.1.5
-# tests
-pytest==8.3.4
+cryptography==44.0.0
 httpx==0.28.1
+# tests (+ tests_e2e/run_e2e.py uses httpx + websockets from uvicorn[standard])
+pytest==8.3.4
 # Live Google connectors (install when the company provides a service account):
 #   pip install google-api-python-client==2.151.0 google-auth==2.36.0
-# PostgreSQL on VPS:
-#   pip install "psycopg[binary]==3.2.3"   and set ITADM_DATABASE_URL=postgresql+psycopg://user:pass@host/db
+# PostgreSQL on VPS (not implemented yet — see docs/CHANGE_REQUESTS.md CR-11):
+#   pip install "psycopg[binary]==3.2.3"

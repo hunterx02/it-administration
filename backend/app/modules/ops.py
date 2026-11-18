@@ -313,6 +313,17 @@ def dashboard(company_id: str | None = None, p: Principal = Depends(require("das
         out["finance"] = {b: spend_summary(db, p, date_from=start, date_to=today(), basis=b,
                                            company_id=company_id)["totals"]
                           for b in ("committed", "invoiced", "paid")}
+        series = []
+        y, m = today().year, today().month
+        for i in range(5, -1, -1):
+            yy, mm = (y, m - i) if m - i > 0 else (y - 1, m - i + 12)
+            first = date(yy, mm, 1)
+            last = (date(yy + (mm == 12), mm % 12 + 1, 1) - timedelta(days=1))
+            series.append({"month": f"{yy}-{mm:02d}",
+                           "paid": spend_summary(db, p, date_from=first, date_to=last, basis="paid", company_id=company_id)["totals"],
+                           "committed": spend_summary(db, p, date_from=first, date_to=last, basis="committed",
+                                                      company_id=company_id)["totals"]})
+        out["finance"]["monthly"] = series
         out["finance"]["open_requests"] = len(list(db.scalars(sc(select(PurchaseRequest), PurchaseRequest.company_id)
                                                               .where(PurchaseRequest.status.in_(
                                                                   ("awaiting_approval", "approved", "in_procurement",
@@ -434,6 +445,49 @@ def r_maint(db: Session, p: Principal, f: dict) -> dict:
     return {"columns": [("asset", "الأصل"), ("issue", "العطل"), ("vendor", "الجهة"), ("opened", "فتح"),
                         ("closed", "قفل"), ("status", "الحالة"), ("cost_linked", "تكلفة مرتبطة")], "rows": rows,
             "summary": {"الإجمالي": len(rows), "مفتوحة": sum(r["status"] == "open" for r in rows)}}
+
+
+@report("assets.warranty", "الضمانات المنتهية والقريبة من الانتهاء", "assets:view",
+        COMMON_FILTERS + [{"key": "category", "label": "الفئة", "type": "asset_category"}], "تاريخ نهاية الضمان")
+def r_warranty(db: Session, p: Principal, f: dict) -> dict:
+    s = _company(select(Asset), p, Asset.company_id, f).where(Asset.warranty_end.is_not(None)).order_by(Asset.warranty_end)
+    if f.get("category"):
+        s = s.where(Asset.category_code == f["category"])
+    rows = []
+    for a in db.scalars(s):
+        if (f.get("date_from") or f.get("date_to")) and not _in_range(a.warranty_end, f):
+            continue
+        left = (a.warranty_end - today()).days
+        rows.append({"code": a.code, "model": f"{a.brand} {a.model}".strip(), "serial": a.serial,
+                     "warranty_end": iso(a.warranty_end), "days_left": left,
+                     "state": "منتهي" if left < 0 else "خلال 30 يوم" if left <= 30 else "ساري",
+                     "holder": (db.get(Employee, a.holder_employee_id).full_name if a.holder_employee_id else "")})
+    return {"columns": [("code", "الكود"), ("model", "الجهاز"), ("serial", "السيريال"), ("warranty_end", "نهاية الضمان"),
+                        ("days_left", "الأيام المتبقية"), ("state", "الحالة"), ("holder", "مع")], "rows": rows,
+            "summary": dict(Counter(r["state"] for r in rows)),
+            "chart": {"type": "doughnut", "data": dict(Counter(r["state"] for r in rows))}}
+
+
+@report("technical.subscriptions", "الاشتراكات والتراخيص — الاستحقاق والرصيد", "technical:view",
+        COMMON_FILTERS + [{"key": "status", "label": "الحالة", "type": "select",
+                           "options": {"active": "نشط", "paused": "موقوف", "cancelled": "ملغي"}}], "تاريخ الاستحقاق")
+def r_subscriptions(db: Session, p: Principal, f: dict) -> dict:
+    s = _company(select(Subscription), p, Subscription.company_id, f).order_by(Subscription.code)
+    if f.get("status"):
+        s = s.where(Subscription.status == f["status"])
+    rows = []
+    for x in db.scalars(s):
+        i = due_info(x.last_payment, x.period_value, x.period_unit, x.alert_days)
+        if (f.get("date_from") or f.get("date_to")) and (not i["next_due"] or not _in_range(date.fromisoformat(i["next_due"]), f)):
+            continue
+        rows.append({"code": x.code, "name": x.name, "type": x.service_type, "provider": x.provider,
+                     "next_due": i["next_due"] or "ناقص", "days_left": "" if i["days_left"] is None else i["days_left"],
+                     "usage": (f"{x.remaining:g} {x.usage_unit}" if x.usage_unit and x.remaining is not None else "—"),
+                     "status": x.status})
+    return {"columns": [("code", "الكود"), ("name", "الاسم"), ("type", "النوع"), ("provider", "المزوّد"),
+                        ("next_due", "الاستحقاق"), ("days_left", "الأيام"), ("usage", "الرصيد"), ("status", "الحالة")],
+            "rows": rows, "summary": {"العدد": len(rows), **dict(Counter(r["type"] or "—" for r in rows))},
+            "chart": {"type": "bar", "data": dict(Counter(r["type"] or "—" for r in rows))}}
 
 
 @report("journey.hires", "المعينون خلال الفترة", "employees:view",
@@ -664,9 +718,9 @@ def print_report(key: str, request: Request, filters: str = "{}", p: Principal =
     flt = "، ".join(f"{h.escape(k)}={h.escape(str(v))}" for k, v in res["filters"].items()) or "بدون فلاتر"
     audit.record(db, "report.printed", actor_id=p.user.id, entity="report", entity_id=key, ip=client_ip(request))
     db.commit()
-    return HTMLResponse(f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>{h.escape(res['title'])}</title>
-<style>@page{{size:A4 landscape;margin:12mm}}body{{font-family:Cairo,Tahoma,sans-serif;color:#000}}table{{width:100%;border-collapse:collapse}}
-td,th{{border:1px solid #888;padding:5px;font-size:12px}}th{{background:#eee}}@media print{{button{{display:none}}}}</style></head>
-<body><button onclick="print()">طباعة / حفظ PDF</button><h2>{h.escape(res['title'])}</h2>
-<p>الفلاتر: {flt} — محور التاريخ: {h.escape(res['date_axis'])}<br>أُنشئ: {res['generated_at'][:16]} بواسطة {h.escape(res['generated_by'])}</p>
-<ul>{summ}</ul><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></body></html>""")
+    from .printing import doc_page
+    company_id = res["filters"].get("company_id") or (p.company_ids() and sorted(p.company_ids())[0]) or None
+    content = (f"<h1>{h.escape(res['title'])}</h1><p>الفلاتر: {flt} — محور التاريخ: {h.escape(res['date_axis'])}<br>"
+               f"أُنشئ: {res['generated_at'][:16]} بواسطة {h.escape(res['generated_by'])}</p><ul>{summ}</ul>"
+               f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+    return HTMLResponse(doc_page(db, company_id, res["title"], content, landscape=True))

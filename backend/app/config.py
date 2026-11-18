@@ -36,6 +36,25 @@ class Settings:
     allowed_origins: tuple[str, ...]
     data_dir: Path = BACKEND_DIR / "data"
     worker_interval_seconds: int = 60
+    secret_key: str = ""          # base64 32-byte AES key (ITADM_SECRET_KEY); generated once into backend/.env
+    secrets_path: Path | None = None  # encrypted secrets file, OUTSIDE the project folder by default
+
+
+def _ensure_secret_key() -> str:
+    """Generate the AES key once and keep it in backend/.env (git-ignored). Losing it = stored secrets unreadable."""
+    key = os.environ.get("ITADM_SECRET_KEY", "")
+    if key:
+        return key
+    import base64
+    import secrets as _s
+    key = base64.b64encode(_s.token_bytes(32)).decode()
+    env = BACKEND_DIR / ".env"
+    if not os.access(BACKEND_DIR, os.W_OK):  # e.g. read-only container: the key must come from env_file
+        raise RuntimeError("ITADM_SECRET_KEY مش موجود — حطه في backend/.env (اقرأ docs/README_DEPLOY_VPS.md)")
+    with env.open("a", encoding="utf-8") as f:
+        f.write(f"\n# AES-256 key for the encrypted secrets store — BACK THIS UP somewhere safe (not in Git)\nITADM_SECRET_KEY={key}\n")
+    os.environ["ITADM_SECRET_KEY"] = key
+    return key
 
 
 def load_settings() -> Settings:
@@ -51,4 +70,7 @@ def load_settings() -> Settings:
         allowed_origins=tuple(o for o in os.environ.get("ITADM_ALLOWED_ORIGINS", "").split(",") if o),
         data_dir=data_dir,
         worker_interval_seconds=int(os.environ.get("ITADM_WORKER_INTERVAL", "60")),
+        secret_key=_ensure_secret_key(),
+        secrets_path=Path(os.environ.get("ITADM_SECRETS_PATH") or
+                          Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ITAdministration" / "secrets.enc.json"),
     )

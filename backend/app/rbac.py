@@ -23,11 +23,13 @@ MODULES: dict[str, str] = {
 
 ACTIONS: dict[str, list[str]] = {
     "dashboard": ["view"],
-    "assets": ["view", "create", "edit", "delete", "approve", "print", "export"],
+    # view_secrets = reveal / set device passwords (stored encrypted; every reveal is audited)
+    "assets": ["view", "create", "edit", "delete", "approve", "print", "export", "view_secrets"],
     # view_sensitive = national ID, salary, HR evaluations/notes, identity documents.
     # it_approve = IT's own approvals inside onboarding/offboarding.
     "employees": ["view", "create", "edit", "delete", "approve", "it_approve", "print", "export", "view_sensitive"],
-    "technical": ["view", "create", "edit", "delete", "approve", "print", "export"],
+    # technical:view_secrets = reveal / set e-mail account passwords (encrypted store, every reveal audited)
+    "technical": ["view", "create", "edit", "delete", "approve", "print", "export", "view_secrets"],
     "finance": ["view", "create", "edit", "delete", "approve", "print", "export"],
     "system": ["view", "edit", "manage_users", "manage_integration", "manage_secrets"],
     "reports": ["view", "print", "export"],

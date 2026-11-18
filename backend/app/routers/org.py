@@ -28,6 +28,8 @@ class NameIn(BaseModel):
 
 def _company_dict(c: Company) -> dict:
     return {"id": c.id, "name": c.name, "asset_prefix": c.asset_prefix, "active": c.active,
+            "letterhead_header_file_id": c.letterhead_header_file_id,
+            "letterhead_footer_file_id": c.letterhead_footer_file_id,
             "branches": [{"id": b.id, "name": b.name, "active": b.active} for b in c.branches],
             "departments": [{"id": d.id, "name": d.name, "active": d.active} for d in c.departments]}
 
@@ -62,6 +64,8 @@ class CompanyPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     asset_prefix: str | None = Field(default=None, max_length=20, pattern=r"^[A-Za-z0-9]*$")
     active: bool | None = None
+    letterhead_header_file_id: str | None = None   # "" clears it
+    letterhead_footer_file_id: str | None = None
 
 
 @router.patch("/{company_id}")
@@ -75,6 +79,15 @@ def update_company(company_id: str, body: CompanyPatch, request: Request, p: Pri
         from ..modules.assets import Asset
         if db.scalar(select(Asset.id).where(Asset.company_id == c.id).limit(1)):
             raise HTTPException(status.HTTP_409_CONFLICT, "مينفعش تغيير البادئة بعد تسجيل أصول — الأكواد ثابتة")
+    for k in ("letterhead_header_file_id", "letterhead_footer_file_id"):
+        if k in changes:
+            if changes[k] == "":
+                changes[k] = None
+            else:
+                from ..modules.files import FileObject
+                fo = db.get(FileObject, changes[k])
+                if fo is None or fo.category != "letterhead" or not fo.mime.startswith("image/"):
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, "الدباجة لازم تكون صورة (PNG/JPG) مرفوعة كدباجة")
     for k, v in changes.items():
         setattr(c, k, v.strip() if isinstance(v, str) else v)
     try:
@@ -105,6 +118,35 @@ def _add_child(kind: str, company_id: str, body: NameIn, request: Request, p: Pr
                  details={"name": obj.name}, ip=client_ip(request))
     db.commit()
     return {"id": obj.id, "name": obj.name, "company_id": company_id}
+
+
+class ChildPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    active: bool | None = None
+
+
+@router.patch("/{company_id}/{kind}/{child_id}")
+def update_child(company_id: str, kind: str, child_id: str, body: ChildPatch, request: Request,
+                 p: Principal = Depends(require("system:edit")), db: Session = Depends(get_db)) -> dict:
+    """Rename or (de)activate a branch/department. Deactivated = hidden from new choices; history kept."""
+    model = {"branches": Branch, "departments": Department}.get(kind)
+    if model is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "نوع غير معروف")
+    obj = db.get(model, child_id)
+    if obj is None or obj.company_id != company_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "غير موجود")
+    changes = body.model_dump(exclude_none=True)
+    for k, v in changes.items():
+        setattr(obj, k, v.strip() if isinstance(v, str) else v)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "الاسم موجود بالفعل في نفس الشركة") from None
+    audit.record(db, f"{kind[:-1] if kind == 'departments' else 'branch'}.updated", actor_id=p.user.id, entity=kind,
+                 entity_id=child_id, company_id=company_id, details=changes, ip=client_ip(request))
+    db.commit()
+    return {"id": obj.id, "name": obj.name, "active": obj.active}
 
 
 @router.post("/{company_id}/branches", status_code=201)

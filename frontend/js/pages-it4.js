@@ -103,7 +103,7 @@
     const cons = DB.consumables.slice().sort((a, b) => (U.num(a.qty) < U.num(a.min) ? 0 : 1) - (U.num(b.qty) < U.num(b.min) ? 0 : 1)).slice(0, 3);
     const mc = Fin.monthlyCost();
     const brs = ((cos.find(c => c.name === sc.company) || {}).branches) || [].concat(...cos.map(c => c.branches));
-    el.innerHTML = `<div class="page-head itx-head" data-live><div><h1>نظرة عامة</h1><p class="sub">آخر مزامنة مع Google Sheets: <b>${s.lastSync ? X.ago(s.lastSync) : 'لسه متعملتش'}</b> · <a href="#/syncerr" class="${errs ? 't-warn' : ''}">${errs} أخطاء مزامنة</a></p></div>
+    el.innerHTML = `<div class="page-head itx-head" data-live><div><h1>Dashboard</h1><p class="sub">آخر مزامنة مع Google Sheets: <b>${s.lastSync ? X.ago(s.lastSync) : 'لسه متعملتش'}</b> · <a href="#/syncerr" class="${errs ? 't-warn' : ''}">${errs} أخطاء مزامنة</a></p></div>
       <div class="actions itx-filters"><label class="mini">الشركة / الفرع <select data-sc="company"><option value="">كل الشركات</option>${cos.map(c => `<option ${sc.company === c.name ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>
         <select data-sc="branch"><option value="">كل الفروع</option>${brs.map(b => `<option ${sc.branch === b ? 'selected' : ''}>${esc(b)}</option>`).join('')}</select>
         <label class="mini">القسم <select data-sc="dept"><option value="">كل الأقسام</option>${X.allDepts().concat(['المخزن العام']).map(d => `<option ${sc.dept === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select></label></div></div>
